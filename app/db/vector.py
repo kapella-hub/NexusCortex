@@ -6,6 +6,7 @@ for the RAG engine's vector retrieval path.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     MatchAny,
+    PayloadSchemaType,
     PointStruct,
     VectorParams,
 )
@@ -32,6 +34,12 @@ logger = logging.getLogger(__name__)
 
 # Deterministic namespace for content-based UUIDs (uuid5).
 NEXUS_UUID_NAMESPACE = uuid.UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+
+# Maximum number of embedding vectors to cache in memory.
+_EMBED_CACHE_MAX_SIZE = 512
+
+# Maximum number of texts to send in a single batch embedding request.
+_BATCH_CHUNK_SIZE = 32
 
 
 class VectorClient:
@@ -47,6 +55,9 @@ class VectorClient:
         self._embedding_model = settings.EMBEDDING_MODEL
         self._client = AsyncQdrantClient(host=self._host, port=self._port)
         self._http_client = httpx.AsyncClient(timeout=30.0)
+        # LRU embedding cache: hash(text) -> embedding vector
+        self._embed_cache: dict[str, list[float]] = {}
+        self._cache_order: list[str] = []
 
     async def initialize(self) -> None:
         """Create the Qdrant collection if it doesn't already exist."""
@@ -75,6 +86,16 @@ class VectorClient:
             raise VectorStoreError(
                 f"Failed to initialize Qdrant collection: {exc}"
             ) from exc
+
+        # Create payload index on tags for faster filtered queries
+        try:
+            await self._client.create_payload_index(
+                collection_name=self._collection,
+                field_name="tags",
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
+        except Exception:
+            pass  # Index may already exist
 
     async def close(self) -> None:
         """Close the underlying Qdrant and HTTP clients."""
@@ -193,11 +214,106 @@ class VectorClient:
                 f"Failed to search vectors: {exc}"
             ) from exc
 
+    async def batch_embed(self, texts: list[str]) -> list[list[float]]:
+        """Generate embeddings for multiple texts, using cache and batching.
+
+        Checks the embedding cache first, then sends uncached texts to the
+        embedding API in chunks of up to 32. Falls back to individual _embed
+        calls if the batch request fails.
+
+        Args:
+            texts: List of text strings to embed.
+
+        Returns:
+            List of embedding vectors in the same order as the input texts.
+        """
+        if not texts:
+            return []
+
+        # Map each input position to its cache key and check for hits
+        cache_keys = [
+            hashlib.sha256(t.encode()).hexdigest() for t in texts
+        ]
+        results: list[list[float] | None] = [None] * len(texts)
+        uncached_indices: list[int] = []
+
+        for i, key in enumerate(cache_keys):
+            if key in self._embed_cache:
+                results[i] = self._embed_cache[key]
+                logger.debug("batch_embed cache hit for index %d", i)
+            else:
+                uncached_indices.append(i)
+
+        if not uncached_indices:
+            return results  # type: ignore[return-value]
+
+        # Batch embed uncached texts in chunks
+        uncached_texts = [texts[i] for i in uncached_indices]
+        try:
+            uncached_embeddings = await self._batch_embed_api(uncached_texts)
+        except Exception:
+            logger.warning(
+                "Batch embed API failed, falling back to individual embeds"
+            )
+            uncached_embeddings = []
+            for text in uncached_texts:
+                uncached_embeddings.append(await self._embed(text))
+
+        # Store results and update cache
+        for idx, embedding in zip(uncached_indices, uncached_embeddings):
+            results[idx] = embedding
+            self._cache_put(cache_keys[idx], embedding)
+
+        return results  # type: ignore[return-value]
+
+    async def _batch_embed_api(self, texts: list[str]) -> list[list[float]]:
+        """Send texts to the embedding API in chunks, return ordered results."""
+        url = f"{self._llm_base_url}/embeddings"
+        headers = {}
+        if self._llm_api_key:
+            headers["Authorization"] = f"Bearer {self._llm_api_key}"
+
+        all_embeddings: list[list[float]] = []
+        for start in range(0, len(texts), _BATCH_CHUNK_SIZE):
+            chunk = texts[start : start + _BATCH_CHUNK_SIZE]
+            try:
+                response = await self._http_client.post(
+                    url,
+                    json={
+                        "model": self._embedding_model,
+                        "input": chunk,
+                    },
+                    headers=headers,
+                )
+                response.raise_for_status()
+                data = response.json()
+                # Sort by index to ensure correct ordering
+                sorted_data = sorted(data["data"], key=lambda x: x["index"])
+                all_embeddings.extend(item["embedding"] for item in sorted_data)
+            except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+                raise VectorStoreError(
+                    f"Batch embedding request failed: {exc}"
+                ) from exc
+            except (KeyError, IndexError, TypeError) as exc:
+                raise VectorStoreError(
+                    f"Failed to parse batch embedding response: {exc}"
+                ) from exc
+
+        return all_embeddings
+
     async def _embed(self, text: str) -> list[float]:
         """Generate an embedding vector via the LLM embeddings endpoint.
 
         Calls POST {LLM_BASE_URL}/embeddings with the configured model.
+        Results are cached by content hash (SHA-256) with LRU eviction.
         """
+        cache_key = hashlib.sha256(text.encode()).hexdigest()
+
+        # Check cache
+        if cache_key in self._embed_cache:
+            logger.debug("Embedding cache hit for text hash %s", cache_key[:12])
+            return self._embed_cache[cache_key]
+
         url = f"{self._llm_base_url}/embeddings"
         headers = {}
         if self._llm_api_key:
@@ -213,7 +329,7 @@ class VectorClient:
             )
             response.raise_for_status()
             data = response.json()
-            return data["data"][0]["embedding"]
+            embedding = data["data"][0]["embedding"]
         except httpx.HTTPStatusError as exc:
             raise VectorStoreError(
                 f"Embedding endpoint returned {exc.response.status_code}: "
@@ -223,3 +339,24 @@ class VectorClient:
             raise VectorStoreError(
                 f"Failed to generate embedding: {exc}"
             ) from exc
+
+        # Store in cache
+        self._cache_put(cache_key, embedding)
+
+        return embedding
+
+    def _cache_put(self, key: str, value: list[float]) -> None:
+        """Insert into the embedding cache with LRU eviction."""
+        if key in self._embed_cache:
+            # Move to end (most recently used)
+            self._cache_order.remove(key)
+            self._cache_order.append(key)
+            return
+
+        if len(self._embed_cache) >= _EMBED_CACHE_MAX_SIZE:
+            # Evict oldest entry
+            evicted = self._cache_order.pop(0)
+            del self._embed_cache[evicted]
+
+        self._embed_cache[key] = value
+        self._cache_order.append(key)

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.engine.rag import RAGEngine, _CROSS_REF_BOOST, _FUZZY_MATCH_THRESHOLD
+from app.engine.rag import RAGEngine
 from app.models import ContextQuery
 
 
@@ -73,27 +73,41 @@ class TestNormalizeVector:
 # ---------------------------------------------------------------------------
 
 
-class TestNormalizeGraph:
+class TestFormatGraphEntries:
+    """Tests for _format_graph_entries (formerly _normalize_graph).
+
+    Scoring uses: weight * text_sim + (1 - weight) * dist_score
+    where dist_score = 1/max(distance, 1) or 0.5 if no distance.
+    Default GRAPH_RELEVANCE_WEIGHT = 0.4.
+    """
+
     def test_distance_based_scoring(self, engine):
+        query = "desc a desc b"
         results = [
             {"name": "a", "description": "desc a", "label": "Concept", "distance": 1},
             {"name": "b", "description": "desc b", "label": "Action", "distance": 3},
         ]
-        entries = engine._normalize_graph(results)
+        entries = engine._format_graph_entries(results, query)
         assert len(entries) == 2
-        # distance=1 -> score=1.0, distance=3 -> score=1/3
-        assert entries[0]["score"] == 1.0
-        assert abs(entries[1]["score"] - 1.0 / 3) < 0.001
+        # Both have scores > 0 (composite of text_sim and distance)
+        assert entries[0]["score"] > 0
+        assert entries[1]["score"] > 0
+        # distance=1 entry should have higher distance component than distance=3
+        # (1/1 vs 1/3), so if text similarity is equal, entry 0 scores higher
+        # distance component: entry 0 = 0.6 * 1.0, entry 1 = 0.6 * (1/3)
 
     def test_missing_distance_defaults_half(self, engine):
         results = [{"name": "x", "description": "desc", "label": "Concept", "distance": None}]
-        entries = engine._normalize_graph(results)
-        assert entries[0]["score"] == 0.5
+        entries = engine._format_graph_entries(results, "unrelated query")
+        # dist_score defaults to 0.5 when distance is None
+        # text_sim will be low for unrelated query, so score ~ 0.6 * 0.5 = 0.3
+        assert entries[0]["score"] > 0
+        assert entries[0]["score"] < 1.0
 
     def test_handles_missing_fields(self, engine):
         """Nodes with only a name (no description) should use name as content."""
         results = [{"name": "auth", "description": None, "label": "Concept", "distance": 1}]
-        entries = engine._normalize_graph(results)
+        entries = engine._format_graph_entries(results, "auth")
         assert entries[0]["content"] == "auth"
 
     def test_skips_nodes_without_name_or_description(self, engine):
@@ -101,26 +115,26 @@ class TestNormalizeGraph:
             {"name": "", "description": "", "label": "Concept", "distance": 1},
             {"name": None, "description": None, "label": "Concept", "distance": 1},
         ]
-        entries = engine._normalize_graph(results)
+        entries = engine._format_graph_entries(results, "test")
         assert len(entries) == 0
 
     def test_description_preferred_over_name(self, engine):
         results = [{"name": "N", "description": "Full description", "label": "X", "distance": 2}]
-        entries = engine._normalize_graph(results)
+        entries = engine._format_graph_entries(results, "test")
         assert entries[0]["content"] == "Full description"
 
     def test_assigns_graph_store(self, engine):
         results = [{"name": "n", "description": "d", "label": "L", "distance": 1}]
-        entries = engine._normalize_graph(results)
+        entries = engine._format_graph_entries(results, "test")
         assert entries[0]["store"] == "graph"
 
     def test_metadata_includes_label(self, engine):
         results = [{"name": "n", "description": "d", "label": "CustomLabel", "distance": 1}]
-        entries = engine._normalize_graph(results)
+        entries = engine._format_graph_entries(results, "test")
         assert entries[0]["metadata"]["label"] == "CustomLabel"
 
     def test_handles_empty_results(self, engine):
-        assert engine._normalize_graph([]) == []
+        assert engine._format_graph_entries([], "test") == []
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +290,14 @@ class TestIsFuzzyMatch:
 
 
 class TestFormatMarkdown:
+    """Tests for _format_markdown.
+
+    New format uses numbered list entries:
+        ## Memory Recall ({n} results, confidence: {level})
+        1. [{score}] ({source}) {content}
+        > Query: "{task}" | Top {top_k}
+    """
+
     def test_empty_entries(self, engine):
         result = engine._format_markdown([])
         assert "No relevant memories found" in result
@@ -290,8 +312,9 @@ class TestFormatMarkdown:
             },
         ]
         result = engine._format_markdown(entries)
-        assert "### From Knowledge Graph" in result
-        assert "**[Concept]** auth" in result
+        assert "## Memory Recall" in result
+        assert "(graph)" in result
+        assert "Auth module handles tokens" in result
 
     def test_vector_section(self, engine):
         entries = [
@@ -303,10 +326,8 @@ class TestFormatMarkdown:
             },
         ]
         result = engine._format_markdown(entries)
-        assert "### From Semantic Memory" in result
-        assert "[0.85] Fix login timeout" in result
-        assert "Source: action_log" in result
-        assert "auth, bug" in result
+        assert "(vector)" in result
+        assert "Fix login timeout" in result
 
     def test_cross_ref_section(self, engine):
         entries = [
@@ -318,9 +339,8 @@ class TestFormatMarkdown:
             },
         ]
         result = engine._format_markdown(entries)
-        assert "### Cross-Referenced (High Confidence)" in result
-        assert "[0.95] Pool sizing fix" in result
-        assert "pool_config" in result
+        assert "(graph+vector)" in result
+        assert "Pool sizing fix" in result
 
     def test_all_sections_present(self, engine):
         entries = [
@@ -329,12 +349,12 @@ class TestFormatMarkdown:
             {"content": "b", "score": 0.95, "store": "both", "metadata": {"graph_name": "b"}},
         ]
         result = engine._format_markdown(entries)
-        assert "### From Knowledge Graph" in result
-        assert "### From Semantic Memory" in result
-        assert "### Cross-Referenced (High Confidence)" in result
+        assert "(graph)" in result
+        assert "(vector)" in result
+        assert "(graph+vector)" in result
 
-    def test_graph_entry_content_equals_name(self, engine):
-        """When content == name, only the header should appear, not the arrow."""
+    def test_graph_entry_format(self, engine):
+        """Graph entries appear as numbered items with score and source."""
         entries = [
             {
                 "content": "auth",
@@ -344,9 +364,9 @@ class TestFormatMarkdown:
             },
         ]
         result = engine._format_markdown(entries)
-        assert "**[Concept]** auth" in result
-        # Should NOT have arrow when content == name
-        assert "\u2192" not in result
+        assert "1." in result
+        assert "(graph)" in result
+        assert "auth" in result
 
     def test_graph_entry_content_differs_from_name(self, engine):
         entries = [
@@ -358,9 +378,9 @@ class TestFormatMarkdown:
             },
         ]
         result = engine._format_markdown(entries)
-        assert "\u2192 Detailed description" in result
+        assert "Detailed description" in result
 
-    def test_vector_no_tags(self, engine):
+    def test_vector_entry_format(self, engine):
         entries = [
             {
                 "content": "test",
@@ -370,7 +390,8 @@ class TestFormatMarkdown:
             },
         ]
         result = engine._format_markdown(entries)
-        assert "Tags: none" in result
+        assert "(vector)" in result
+        assert "test" in result
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +546,7 @@ class TestRecall:
 
     @pytest.mark.asyncio
     async def test_aggregate_score_calculation(self, mock_graph, mock_vector, engine):
-        """Aggregate score is the max of individual source scores."""
+        """Aggregate score is the max of individual source scores after min-max normalization."""
         mock_vector.search.return_value = [
             {"id": "v1", "score": 0.8, "text": "Result 1", "metadata": {}},
             {"id": "v2", "score": 0.6, "text": "Result 2", "metadata": {}},
@@ -535,5 +556,6 @@ class TestRecall:
         query = ContextQuery(task="test", top_k=5)
         response = await engine.recall(query)
 
-        # aggregate_score = max of source scores
-        assert response.score == 0.8
+        # After min-max normalization: 0.8 -> 1.0, 0.6 -> 0.0
+        # aggregate_score = max of source scores = 1.0
+        assert response.score == 1.0

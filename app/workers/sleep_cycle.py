@@ -59,17 +59,47 @@ CONSOLIDATION_SYSTEM_PROMPT = (
     "You are the cognitive consolidation engine for Nexus Cortex. "
     "Your job is to analyze the following batch of raw logs, errors, or events, "
     "deduplicate the noise, and extract a structured Knowledge Graph.\n\n"
-    "Identify the core concepts, the actions taken, any errors triggered, and how they relate.\n"
-    "You must return ONLY a valid JSON object with the following structure. "
-    "Do not include markdown formatting or explanations.\n\n"
+    "## Node Type Definitions\n"
+    "- **Concept**: A technical term, abstraction, or domain entity "
+    "(e.g. a class name, protocol, algorithm, configuration key).\n"
+    "- **Action**: Something that was done — a function call, deployment, "
+    "configuration change, or user operation.\n"
+    "- **Outcome**: The result of an action — success, failure, error message, "
+    "performance metric, or observable behavior.\n"
+    "- **Resolution**: A fix applied to address a negative outcome — a code change, "
+    "config update, rollback, or workaround.\n\n"
+    "## Edge Type Definitions\n"
+    "- **RELATES_TO**: General association between two concepts.\n"
+    "- **CAUSED**: An action or event that led to an outcome.\n"
+    "- **RESOLVED_BY**: An outcome (typically negative) that was fixed by a resolution.\n"
+    "- **UTILIZES**: An action or resolution that uses a concept or tool.\n\n"
+    "## Naming Conventions\n"
+    "- Use lowercase_underscore for all node IDs (e.g. \"redis_connection_pool\", "
+    "\"deploy_staging\", \"timeout_error\").\n"
+    "- Be consistent — use the same ID for the same concept across events.\n"
+    "- Keep descriptions concise but informative.\n\n"
+    "## Output Format\n"
+    "You must return ONLY a valid JSON object. "
+    "No markdown fencing, no explanations. Output valid JSON only.\n\n"
+    "Example:\n"
     "{\n"
     '  "nodes": [\n'
-    '    {"id": "unique_string", "label": "Concept|Action|Outcome|Resolution", '
-    '"properties": {"description": "summary of the node"}}\n'
+    '    {"id": "redis_connection_pool", "label": "Concept", '
+    '"properties": {"description": "Redis connection pooling mechanism"}},\n'
+    '    {"id": "increase_pool_size", "label": "Action", '
+    '"properties": {"description": "Increased Redis pool size from 10 to 50"}},\n'
+    '    {"id": "connection_timeout_resolved", "label": "Outcome", '
+    '"properties": {"description": "Connection timeouts stopped after pool resize"}},\n'
+    '    {"id": "pool_size_fix", "label": "Resolution", '
+    '"properties": {"description": "Set REDIS_POOL_SIZE=50 in production config"}}\n'
     "  ],\n"
     '  "edges": [\n'
-    '    {"source": "node_id", "target": "node_id", '
-    '"type": "RELATES_TO|CAUSED|RESOLVED_BY|UTILIZES"}\n'
+    '    {"source": "increase_pool_size", "target": "redis_connection_pool", '
+    '"type": "UTILIZES"},\n'
+    '    {"source": "increase_pool_size", "target": "connection_timeout_resolved", '
+    '"type": "CAUSED"},\n'
+    '    {"source": "connection_timeout_resolved", "target": "pool_size_fix", '
+    '"type": "RESOLVED_BY"}\n'
     "  ]\n"
     "}"
 )
@@ -100,6 +130,31 @@ def _close_neo4j_driver():
     if _neo4j_driver is not None:
         _neo4j_driver.close()
         _neo4j_driver = None
+
+
+# ---------------------------------------------------------------------------
+# Cached Redis client — reused across batch calls
+# ---------------------------------------------------------------------------
+
+_redis_client: redis.Redis | None = None
+
+
+def _get_redis_client() -> redis.Redis:
+    """Return a module-level Redis client, creating it on first call."""
+    global _redis_client
+    if _redis_client is None:
+        s = get_settings()
+        _redis_client = redis.from_url(s.REDIS_URL, decode_responses=True)
+        atexit.register(_close_redis_client)
+    return _redis_client
+
+
+def _close_redis_client():
+    """Close the cached Redis client on process exit."""
+    global _redis_client
+    if _redis_client is not None:
+        _redis_client.close()
+        _redis_client = None
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +276,7 @@ def process_event_batch() -> dict[str, Any]:
 def _process_batch() -> dict[str, Any]:
     """Core batch processing logic, separated for clarity."""
     settings = get_settings()
-    redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+    redis_client = _get_redis_client()
 
     # Pop up to REDIS_BATCH_SIZE items using a pipeline for efficiency
     pipe = redis_client.pipeline()

@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +55,9 @@ class ActionLog(BaseModel):
     }
 
 
+_MAX_PAYLOAD_SERIALIZED_BYTES = 50_000  # 50 KB limit per event payload
+
+
 class GenericEventIngest(BaseModel):
     """Arbitrary event data for stream ingestion into the Redis queue."""
 
@@ -62,6 +65,17 @@ class GenericEventIngest(BaseModel):
     payload: dict[str, Any]
     timestamp: datetime | None = None
     tags: list[Annotated[str, Field(max_length=100)]] = Field(default=[], max_length=20)
+
+    @model_validator(mode="after")
+    def _validate_payload_size(self) -> "GenericEventIngest":
+        """Reject payloads that exceed the serialized byte limit."""
+        import json as _json
+
+        serialized = _json.dumps(self.payload, default=str)
+        if len(serialized) > _MAX_PAYLOAD_SERIALIZED_BYTES:
+            msg = f"Payload exceeds maximum size of {_MAX_PAYLOAD_SERIALIZED_BYTES} bytes"
+            raise ValueError(msg)
+        return self
 
     def model_post_init(self, __context: Any) -> None:
         if self.timestamp is None:
@@ -104,6 +118,7 @@ class RecallResponse(BaseModel):
     context_block: str
     sources: list[MemorySource]
     score: float
+    request_id: str | None = None
 
 
 class LearnResponse(BaseModel):
@@ -133,3 +148,35 @@ class HealthResponse(BaseModel):
 
     status: str
     services: dict[str, ServiceStatus]
+    version: str = "0.4.0"
+    uptime_seconds: float | None = None
+    memory_count: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# Error & Feedback Models
+# ---------------------------------------------------------------------------
+
+
+class ErrorDetail(BaseModel):
+    """Structured error response with machine-readable code."""
+
+    error_code: str
+    detail: str
+    request_id: str | None = None
+    suggestion: str | None = None
+
+
+class FeedbackRequest(BaseModel):
+    """Relevance feedback for recalled memories."""
+
+    memory_ids: list[str] = Field(..., min_length=1, max_length=50)
+    useful: bool
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class FeedbackResponse(BaseModel):
+    """Response from /memory/feedback."""
+
+    status: str
+    updated: int

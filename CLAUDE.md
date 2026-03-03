@@ -24,6 +24,7 @@ app/
 ├── models.py          # Request/response Pydantic models
 ├── exceptions.py      # NexusCortexError hierarchy
 ├── main.py            # FastAPI app, lifespan, routes, DI
+├── mcp_server.py      # MCP server (Streamable HTTP, 4 tools)
 ├── db/
 │   ├── graph.py       # Neo4j async client, Cypher queries
 │   └── vector.py      # Qdrant async client, embedding + search
@@ -35,9 +36,17 @@ app/
 
 ### API Endpoints
 - `POST /memory/recall` — Dual-retrieval RAG query, returns Markdown for LLM injection
-- `POST /memory/learn` — Logs actions/outcomes/resolutions to both graph + vector
-- `POST /memory/stream` — High-volume event ingest → Redis queue
-- `GET /health` — Service connectivity status
+- `POST /memory/learn` — Logs actions/outcomes/resolutions to both graph + vector (parallel writes)
+- `POST /memory/stream` — High-volume event ingest → Redis queue (pipeline batching)
+- `POST /memory/feedback` — Submit feedback on memory usefulness
+- `GET /health` — Service connectivity status with version, uptime, memory count
+
+### MCP Server (port 8080)
+Exposes 4 MCP tools via Streamable HTTP (`/mcp` endpoint):
+- `memory_recall` — Recall relevant memories for a task (returns Markdown)
+- `memory_learn` — Store action/outcome pairs in long-term memory
+- `memory_stream` — Ingest raw events into the processing queue
+- `memory_health` — Check service health status
 
 ### Data Flow
 - `/recall` → RAG engine queries Qdrant (semantic) + Neo4j (graph) concurrently → merges/boosts scores → Markdown
@@ -72,21 +81,39 @@ pytest tests/test_models.py -k "test_context_query" -v  # single test
 celery -A app.workers.sleep_cycle worker --beat --loglevel=info
 ```
 
+### Run MCP server standalone
+```bash
+python -m app.mcp_server
+```
+
 ## Configuration
 
 All configuration via environment variables or `.env` file. See `.env.example` for all options. Key settings:
-- `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`
+- `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_POOL_SIZE`
 - `QDRANT_HOST`, `QDRANT_PORT`, `QDRANT_COLLECTION`
 - `REDIS_URL`, `REDIS_STREAM_KEY`
 - `LLM_BASE_URL`, `LLM_MODEL`, `EMBEDDING_MODEL`
+- `API_KEY`, `CORS_ORIGINS`, `RATE_LIMIT` (security)
+- `BOOST_FACTOR`, `GRAPH_RELEVANCE_WEIGHT`, `CONTENT_HASH_LENGTH` (RAG tuning)
+- `RERANK_ENABLED`, `RERANK_CANDIDATES_MULTIPLIER`, `MEMORY_DECAY_HALF_LIFE_DAYS` (advanced)
+- `NEXUS_API_URL`, `MCP_HOST`, `MCP_PORT`, `NEXUS_API_KEY` (MCP server)
 
 ## Key Design Decisions
 
 - **No APOC dependency**: Neo4j Cypher uses standard MERGE with dynamic labels grouped by type and sanitized against injection
-- **Dual-store scoring**: Items found in both Qdrant and Neo4j get a 1.5x score boost via fuzzy text matching (SequenceMatcher > 0.7)
+- **Dual-store scoring**: Items found in both Qdrant and Neo4j get a configurable boost (default 1.5x) via substring + Jaccard similarity matching (threshold 0.3)
+- **Score normalization**: Min-max normalization per source to [0,1] before merging, with composite graph scoring (text relevance + distance)
 - **Graceful degradation**: If one store fails during recall, the other still contributes results
 - **Sleep Cycle DLQ**: Failed batches go to `nexus:event_stream:dlq` Redis key for later reprocessing
 - **Cypher injection prevention**: Dynamic labels/relationship types are sanitized to alphanumeric + underscore only
+- **Fulltext index search**: Neo4j Lucene-backed fulltext index for relevance-scored graph queries (falls back to CONTAINS)
+- **API key authentication**: Optional X-API-Key middleware (skips /health, /docs)
+- **Rate limiting**: slowapi-based rate limiting (configurable, default 60/min)
+- **Memory decay**: Exponential decay based on entry age (configurable half-life, default 90 days)
+- **LLM re-ranking**: Optional re-ranking pass via LLM (gated behind RERANK_ENABLED config)
+- **Embedding cache**: LRU cache (512 entries) for vector embeddings
+- **Entity canonicalization**: Lowercase + normalize names before MERGE to reduce duplicates
+- **Redis pipeline batching**: Pipeline pattern for both event ingest and Sleep Cycle rpop
 
 ## Development Practices
 

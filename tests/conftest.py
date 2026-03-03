@@ -68,6 +68,14 @@ def mock_redis() -> AsyncMock:
     r.lpush = AsyncMock(return_value=1)
     r.rpop = AsyncMock(return_value=None)
     r.aclose = AsyncMock()
+
+    # Pipeline support: pipeline() returns an object with lpush + execute
+    mock_pipe = MagicMock()
+    mock_pipe.lpush = MagicMock(return_value=mock_pipe)
+    mock_pipe.execute = AsyncMock(return_value=[1])
+    r.pipeline = MagicMock(return_value=mock_pipe)
+    r._pipeline = mock_pipe  # exposed for test assertions
+
     return r
 
 

@@ -18,11 +18,15 @@ build/
 venv/
 ENV/
 
-# IDE
+# IDE / editor
 .idea/
 .vscode/
 *.swp
 *.swo
+
+# Agent / tool metadata
+.serena/
+.claude/
 
 # OS
 .DS_Store

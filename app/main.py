@@ -5,14 +5,22 @@ Memory-as-a-Service layer providing persistent cognitive memory for LLM agents.
 
 from __future__ import annotations
 
+import asyncio
+import hmac
 import json
 import logging
+import uuid
 from contextlib import asynccontextmanager
-from typing import Annotated
+from datetime import datetime, timezone
+from typing import Annotated, Any
 
 import redis.asyncio
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.config import get_settings
@@ -29,6 +37,9 @@ from app.exceptions import (
 from app.models import (
     ActionLog,
     ContextQuery,
+    ErrorDetail,
+    FeedbackRequest,
+    FeedbackResponse,
     GenericEventIngest,
     HealthResponse,
     LearnResponse,
@@ -37,10 +48,25 @@ from app.models import (
     StreamResponse,
 )
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S%z",
+)
 logger = logging.getLogger(__name__)
 
 MAX_BATCH_SIZE = 100
 MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
+
+# ---------------------------------------------------------------------------
+# Rate limiter
+# ---------------------------------------------------------------------------
+
+limiter = Limiter(key_func=get_remote_address)
 
 
 # ---------------------------------------------------------------------------
@@ -55,8 +81,10 @@ async def lifespan(app: FastAPI):
     app.state.graph_client = Neo4jClient(settings)
     app.state.vector_client = VectorClient(settings)
     app.state.redis_client = redis.asyncio.from_url(settings.REDIS_URL)
+    app.state.start_time = datetime.now(timezone.utc)
 
     await app.state.graph_client.connect()
+    await app.state.graph_client.ensure_indexes()
     await app.state.vector_client.initialize()
 
     yield
@@ -73,9 +101,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="NexusCortex",
     description="Memory-as-a-Service for LLM agents",
-    version="0.1.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
+
+app.state.limiter = limiter
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +114,11 @@ app = FastAPI(
 
 
 class RequestBodySizeLimitMiddleware:
-    """Reject requests whose Content-Length exceeds MAX_REQUEST_BODY_BYTES."""
+    """Reject requests exceeding MAX_REQUEST_BODY_BYTES.
+
+    Checks Content-Length header upfront and also tracks actual bytes
+    received to guard against chunked-encoding bypass.
+    """
 
     def __init__(self, app: ASGIApp, max_bytes: int = MAX_REQUEST_BODY_BYTES) -> None:
         self.app = app
@@ -101,10 +135,125 @@ class RequestBodySizeLimitMiddleware:
                 )
                 await response(scope, receive, send)
                 return
+
+            # Track actual bytes for chunked/streaming requests
+            total_bytes = 0
+            max_bytes = self.max_bytes
+
+            async def receive_with_limit() -> dict:
+                nonlocal total_bytes
+                message = await receive()
+                if message.get("type") == "http.request":
+                    body = message.get("body", b"")
+                    total_bytes += len(body)
+                    if total_bytes > max_bytes:
+                        raise HTTPException(status_code=413, detail="Request body too large")
+                return message
+
+            await self.app(scope, receive_with_limit, send)
+            return
         await self.app(scope, receive, send)
 
 
+class APIKeyMiddleware:
+    """Validate X-API-Key header when API_KEY is configured.
+
+    Skips validation for /health, /docs, /redoc, and /openapi.json.
+    If API_KEY is None (not configured), all requests pass through.
+    """
+
+    SKIP_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            settings = get_settings()
+            if settings.API_KEY is not None:
+                path = scope.get("path", "")
+                if path not in self.SKIP_PATHS:
+                    headers = dict(scope.get("headers", []))
+                    api_key = headers.get(b"x-api-key", b"").decode("utf-8", errors="replace")
+                    if not hmac.compare_digest(api_key, settings.API_KEY):
+                        request_id = headers.get(b"x-request-id", b"").decode("utf-8", errors="replace") or None
+                        error = ErrorDetail(
+                            error_code="UNAUTHORIZED",
+                            detail="Invalid or missing API key",
+                            request_id=request_id,
+                        )
+                        response = JSONResponse(
+                            status_code=401,
+                            content=error.model_dump(exclude_none=True),
+                        )
+                        await response(scope, receive, send)
+                        return
+        await self.app(scope, receive, send)
+
+
+class RequestIDMiddleware:
+    """Inject a unique X-Request-Id into each request and response.
+
+    If the client provides an X-Request-Id header, it is preserved.
+    Otherwise, a new UUID is generated.
+    The ID is stored in request scope for use by exception handlers.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        existing_id = headers.get(b"x-request-id", b"").decode("utf-8", errors="replace")
+        # Sanitize client-supplied request IDs: allow only safe chars, max 128 chars
+        if existing_id and len(existing_id) <= 128 and all(
+            c.isalnum() or c in "-_." for c in existing_id
+        ):
+            request_id = existing_id
+        else:
+            request_id = str(uuid.uuid4())
+
+        # Store in scope for downstream access
+        scope.setdefault("state", {})
+        scope["state"]["request_id"] = request_id
+
+        async def send_with_request_id(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers.append((b"x-request-id", request_id.encode("utf-8")))
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_with_request_id)
+
+
+def _get_request_id(request: Request) -> str | None:
+    """Extract request ID from request state, with fallback."""
+    try:
+        return request.state.request_id
+    except AttributeError:
+        return None
+
+
+# Middleware order matters: outermost (first added) wraps innermost (last added).
+# Execution order: RequestBodySize -> CORS -> APIKey -> RequestID -> App
 app.add_middleware(RequestBodySizeLimitMiddleware)
+
+settings = get_settings()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-API-Key", "X-Request-Id"],
+)
+
+app.add_middleware(APIKeyMiddleware)
+app.add_middleware(RequestIDMiddleware)
 
 
 # ---------------------------------------------------------------------------
@@ -129,34 +278,70 @@ async def get_redis(request: Request) -> redis.asyncio.Redis:
 # ---------------------------------------------------------------------------
 
 
+@app.exception_handler(RateLimitExceeded)
+async def handle_rate_limit(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    error = ErrorDetail(
+        error_code="RATE_LIMITED",
+        detail="Rate limit exceeded. Please slow down.",
+        request_id=_get_request_id(request),
+        suggestion="Reduce request frequency or contact the administrator.",
+    )
+    return JSONResponse(status_code=429, content=error.model_dump(exclude_none=True))
+
+
 @app.exception_handler(GraphConnectionError)
 async def handle_graph_error(request: Request, exc: GraphConnectionError) -> JSONResponse:
     logger.error("Graph connection error: %s", exc)
-    return JSONResponse(status_code=503, content={"detail": "Knowledge graph service unavailable"})
+    error = ErrorDetail(
+        error_code="GRAPH_UNAVAILABLE",
+        detail="Knowledge graph service unavailable",
+        request_id=_get_request_id(request),
+    )
+    return JSONResponse(status_code=503, content=error.model_dump(exclude_none=True))
 
 
 @app.exception_handler(VectorStoreError)
 async def handle_vector_error(request: Request, exc: VectorStoreError) -> JSONResponse:
     logger.error("Vector store error: %s", exc)
-    return JSONResponse(status_code=502, content={"detail": "Vector store service error"})
+    error = ErrorDetail(
+        error_code="VECTOR_ERROR",
+        detail="Vector store service error",
+        request_id=_get_request_id(request),
+    )
+    return JSONResponse(status_code=502, content=error.model_dump(exclude_none=True))
 
 
 @app.exception_handler(LLMExtractionError)
 async def handle_llm_error(request: Request, exc: LLMExtractionError) -> JSONResponse:
     logger.error("LLM extraction error: %s", exc)
-    return JSONResponse(status_code=502, content={"detail": "LLM extraction service error"})
+    error = ErrorDetail(
+        error_code="LLM_ERROR",
+        detail="LLM extraction service error",
+        request_id=_get_request_id(request),
+    )
+    return JSONResponse(status_code=502, content=error.model_dump(exclude_none=True))
 
 
 @app.exception_handler(StreamIngestionError)
 async def handle_stream_error(request: Request, exc: StreamIngestionError) -> JSONResponse:
     logger.error("Stream ingestion error: %s", exc)
-    return JSONResponse(status_code=502, content={"detail": "Event stream ingestion error"})
+    error = ErrorDetail(
+        error_code="STREAM_ERROR",
+        detail="Event stream ingestion error",
+        request_id=_get_request_id(request),
+    )
+    return JSONResponse(status_code=502, content=error.model_dump(exclude_none=True))
 
 
 @app.exception_handler(NexusCortexError)
 async def handle_nexus_error(request: Request, exc: NexusCortexError) -> JSONResponse:
     logger.error("NexusCortex error: %s", exc)
-    return JSONResponse(status_code=500, content={"detail": "Internal service error"})
+    error = ErrorDetail(
+        error_code="INTERNAL_ERROR",
+        detail="Internal service error",
+        request_id=_get_request_id(request),
+    )
+    return JSONResponse(status_code=500, content=error.model_dump(exclude_none=True))
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +363,8 @@ async def health(
         await redis_client.ping()
         services["redis"] = ServiceStatus(status="connected")
     except Exception as exc:
-        services["redis"] = ServiceStatus(status="disconnected", detail=str(exc))
+        logger.warning("Redis health check failed: %s", exc)
+        services["redis"] = ServiceStatus(status="disconnected", detail="Service unreachable")
 
     # Neo4j
     try:
@@ -186,60 +372,90 @@ async def health(
         await driver.verify_connectivity()
         services["graph"] = ServiceStatus(status="connected")
     except Exception as exc:
-        services["graph"] = ServiceStatus(status="disconnected", detail=str(exc))
+        logger.warning("Neo4j health check failed: %s", exc)
+        services["graph"] = ServiceStatus(status="disconnected", detail="Service unreachable")
 
     # Qdrant
     try:
         await vector._client.get_collections()
         services["qdrant"] = ServiceStatus(status="connected")
     except Exception as exc:
-        services["qdrant"] = ServiceStatus(status="disconnected", detail=str(exc))
+        logger.warning("Qdrant health check failed: %s", exc)
+        services["qdrant"] = ServiceStatus(status="disconnected", detail="Service unreachable")
+
+    # Uptime
+    uptime_seconds: float | None = None
+    try:
+        start_time = app.state.start_time
+        uptime_seconds = (datetime.now(timezone.utc) - start_time).total_seconds()
+    except AttributeError:
+        pass
+
+    # Memory count from Qdrant
+    memory_count: int | None = None
+    try:
+        collection_info = await vector._client.get_collection(vector._collection)
+        memory_count = collection_info.points_count
+    except Exception:
+        pass
 
     all_connected = all(s.status == "connected" for s in services.values())
     return HealthResponse(
         status="ok" if all_connected else "degraded",
         services=services,
+        version="0.4.0",
+        uptime_seconds=uptime_seconds,
+        memory_count=memory_count,
     )
 
 
 @app.post("/memory/recall", response_model=RecallResponse)
+@limiter.limit(lambda: get_settings().RATE_LIMIT)
 async def memory_recall(
+    request: Request,
     query: ContextQuery,
     graph: Annotated[Neo4jClient, Depends(get_graph)],
     vector: Annotated[VectorClient, Depends(get_vector)],
 ) -> RecallResponse:
     """Dual-retrieval memory recall: graph + vector search, merged and scored."""
     engine = RAGEngine(graph=graph, vector=vector)
-    return await engine.recall(query)
+    result = await engine.recall(query)
+    result.request_id = _get_request_id(request)
+    return result
 
 
 @app.post("/memory/learn", response_model=LearnResponse)
+@limiter.limit(lambda: get_settings().RATE_LIMIT)
 async def memory_learn(
+    request: Request,
     log: ActionLog,
     graph: Annotated[Neo4jClient, Depends(get_graph)],
     vector: Annotated[VectorClient, Depends(get_vector)],
 ) -> LearnResponse:
     """Store an action log in both the knowledge graph and vector store."""
-    graph_id = await graph.merge_action_log(log)
-
-    text = f"{log.action} | {log.outcome}"
+    text = f"{log.action}. The outcome was: {log.outcome}."
     if log.resolution:
-        text += f" | Resolution: {log.resolution}"
+        text += f" Resolution: {log.resolution}"
 
-    vector_id = await vector.upsert(
-        text=text,
-        metadata={
-            "source": "action_log",
-            "tags": log.tags,
-            "domain": log.domain,
-        },
+    graph_id, vector_id = await asyncio.gather(
+        graph.merge_action_log(log),
+        vector.upsert(
+            text=text,
+            metadata={
+                "source": "action_log",
+                "tags": log.tags,
+                "domain": log.domain,
+            },
+        ),
     )
 
     return LearnResponse(status="stored", graph_id=graph_id, vector_id=vector_id)
 
 
 @app.post("/memory/stream", response_model=StreamResponse)
+@limiter.limit(lambda: get_settings().RATE_LIMIT)
 async def memory_stream(
+    request: Request,
     events: GenericEventIngest | list[GenericEventIngest],
     redis_client: Annotated[redis.asyncio.Redis, Depends(get_redis)],
 ) -> StreamResponse:
@@ -256,12 +472,42 @@ async def memory_stream(
         )
 
     try:
+        pipe = redis_client.pipeline()
         for event in events:
-            await redis_client.lpush(
-                settings.REDIS_STREAM_KEY,
-                event.model_dump_json(),
-            )
+            pipe.lpush(settings.REDIS_STREAM_KEY, event.model_dump_json())
+        await pipe.execute()
     except Exception as exc:
         raise StreamIngestionError(f"Failed to push events to Redis: {exc}") from exc
 
     return StreamResponse(status="queued", queued=len(events))
+
+
+@app.post("/memory/feedback", response_model=FeedbackResponse)
+@limiter.limit(lambda: get_settings().RATE_LIMIT)
+async def memory_feedback(
+    request: Request,
+    feedback: FeedbackRequest,
+    vector: Annotated[VectorClient, Depends(get_vector)],
+) -> FeedbackResponse:
+    """Record relevance feedback for recalled memories.
+
+    Updates the Qdrant payload metadata for each referenced memory point
+    with the feedback signal (useful/not useful) and optional comment.
+    """
+    updated = 0
+    for memory_id in feedback.memory_ids:
+        try:
+            await vector._client.set_payload(
+                collection_name=vector._collection,
+                payload={
+                    "feedback_useful": feedback.useful,
+                    "feedback_comment": feedback.comment,
+                    "feedback_timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+                points=[memory_id],
+            )
+            updated += 1
+        except Exception:
+            logger.warning("Failed to update feedback for memory %s", memory_id)
+
+    return FeedbackResponse(status="recorded", updated=updated)

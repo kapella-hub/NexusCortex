@@ -1,11 +1,14 @@
 services:
   neo4j:
     image: neo4j:5-community
+    restart: unless-stopped
     ports:
       - "127.0.0.1:7474:7474"
       - "127.0.0.1:7687:7687"
     environment:
       NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set}
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_pagecache_size: 512m
     volumes:
       - neo4j_data:/data
     healthcheck:
@@ -17,11 +20,12 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1g
+          memory: 2g
           cpus: "1.0"
 
   qdrant:
     image: qdrant/qdrant:v1.13.2
+    restart: unless-stopped
     ports:
       - "127.0.0.1:6333:6333"
       - "127.0.0.1:6334:6334"
@@ -41,6 +45,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     command: redis-server --appendonly yes
     ports:
       - "127.0.0.1:6379:6379"
@@ -62,9 +67,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    restart: unless-stopped
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     env_file:
       - .env
     depends_on:
@@ -74,6 +80,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     deploy:
       resources:
         limits:
@@ -84,6 +96,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    restart: unless-stopped
     command: celery -A app.workers.sleep_cycle worker --beat --loglevel=info
     env_file:
       - .env
@@ -97,6 +110,35 @@ services:
         limits:
           memory: 512m
           cpus: "0.5"
+
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: python -m app.mcp_server
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      NEXUS_API_URL: http://api:8000
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8080"
+    env_file:
+      - .env
+    depends_on:
+      api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/mcp')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.25"
 
 volumes:
   neo4j_data:

@@ -100,7 +100,7 @@ class TestHealthEndpoint:
         assert body["services"]["redis"]["status"] == "disconnected"
 
     def test_health_degraded_includes_error_detail(self, test_client, mock_graph, mock_vector, mock_redis):
-        """Disconnected services include error detail."""
+        """Disconnected services include generic detail (no internal info leak)."""
         mock_driver = MagicMock()
         mock_driver.verify_connectivity = AsyncMock(side_effect=RuntimeError("connection refused"))
         mock_graph._ensure_driver = MagicMock(return_value=mock_driver)
@@ -114,7 +114,8 @@ class TestHealthEndpoint:
         resp = test_client.get("/health")
         body = resp.json()
         assert body["services"]["graph"]["detail"] is not None
-        assert "connection refused" in body["services"]["graph"]["detail"]
+        # Detail should be generic — no internal host/port/driver info leaked
+        assert body["services"]["graph"]["detail"] == "Service unreachable"
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +261,9 @@ class TestMemoryStream:
         body = resp.json()
         assert body["status"] == "queued"
         assert body["queued"] == 1
-        mock_redis.lpush.assert_called_once()
+        mock_redis.pipeline.assert_called_once()
+        mock_redis._pipeline.lpush.assert_called_once()
+        mock_redis._pipeline.execute.assert_called_once()
 
     def test_stream_batch_events(self, test_client, mock_redis):
         events = [
@@ -272,7 +275,7 @@ class TestMemoryStream:
         assert resp.status_code == 200
         body = resp.json()
         assert body["queued"] == 3
-        assert mock_redis.lpush.call_count == 3
+        assert mock_redis._pipeline.lpush.call_count == 3
 
     def test_stream_batch_exceeds_max_returns_422(self, test_client, mock_redis):
         """Sending more than MAX_BATCH_SIZE (100) events returns 422."""
@@ -285,8 +288,8 @@ class TestMemoryStream:
         assert "Batch size exceeds maximum" in resp.json()["detail"]
 
     def test_stream_redis_failure(self, test_client, mock_redis):
-        """Redis lpush failure should surface as a 502."""
-        mock_redis.lpush.side_effect = Exception("connection refused")
+        """Redis pipeline failure should surface as a 502."""
+        mock_redis._pipeline.execute = AsyncMock(side_effect=Exception("connection refused"))
 
         resp = test_client.post(
             "/memory/stream",
@@ -359,7 +362,7 @@ class TestExceptionHandlers:
     def test_stream_ingestion_error_returns_502(
         self, test_client, mock_redis
     ):
-        mock_redis.lpush.side_effect = Exception("Redis down")
+        mock_redis._pipeline.execute = AsyncMock(side_effect=Exception("Redis down"))
         resp = test_client.post(
             "/memory/stream",
             json={"source": "s", "payload": {"k": "v"}},

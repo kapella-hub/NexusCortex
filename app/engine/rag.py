@@ -9,51 +9,127 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from difflib import SequenceMatcher
+import re
+from datetime import datetime, timezone
 from typing import Any
 
+import httpx
+
+from app.config import Settings, get_settings
 from app.db.graph import Neo4jClient
 from app.db.vector import VectorClient
 from app.models import ContextQuery, MemorySource, RecallResponse
 
 logger = logging.getLogger(__name__)
 
-# Boost factor applied when a concept is found in both stores.
-_CROSS_REF_BOOST = 1.5
+# Regex pattern for detecting error-related queries.
+_ERROR_PATTERN = re.compile(
+    r"\b(error|fail|bug|crash|exception|broken|wrong|issue)\b",
+    re.IGNORECASE,
+)
 
-# Minimum SequenceMatcher ratio to consider two text entries as matching.
-_FUZZY_MATCH_THRESHOLD = 0.7
+# Minimum Jaccard similarity to consider two text entries as matching.
+_JACCARD_MATCH_THRESHOLD = 0.3
+
+
+def _tokenize(text: str) -> set[str]:
+    """Split text into lowercase word tokens."""
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _jaccard_similarity(a: set[str], b: set[str]) -> float:
+    """Compute Jaccard similarity between two token sets."""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _min_max_normalize(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize entry scores to [0, 1] via min-max normalization.
+
+    If the set has a single item, its score is capped at 1.0.
+    If all scores are identical, they are all set to 1.0.
+    """
+    if not entries:
+        return entries
+
+    scores = [e["score"] for e in entries]
+    min_s = min(scores)
+    max_s = max(scores)
+
+    if len(entries) == 1:
+        entries[0]["score"] = min(entries[0]["score"], 1.0)
+        return entries
+
+    if max_s == min_s:
+        for e in entries:
+            e["score"] = 1.0
+        return entries
+
+    for e in entries:
+        e["score"] = (e["score"] - min_s) / (max_s - min_s)
+
+    return entries
 
 
 class RAGEngine:
     """Dual-retrieval cognitive engine combining graph and vector search."""
 
-    def __init__(self, graph: Neo4jClient, vector: VectorClient) -> None:
+    def __init__(
+        self,
+        graph: Neo4jClient,
+        vector: VectorClient,
+        settings: Settings | None = None,
+    ) -> None:
         self._graph = graph
         self._vector = vector
+        self._settings = settings or get_settings()
 
     async def recall(self, query: ContextQuery) -> RecallResponse:
         """Retrieve, merge, score, and format memory context for an LLM.
 
         Steps:
             1. Concurrent dual-retrieval from Qdrant and Neo4j.
-            2. Normalize scores to [0, 1].
-            3. Fuzzy-match entries across stores; boost cross-referenced items.
-            4. Deduplicate, sort by score descending, take top_k.
-            5. Format as structured Markdown.
+            2. Optionally query resolutions for error-related tasks.
+            3. Normalize scores to [0, 1] per source via min-max.
+            4. Fuzzy-match entries across stores; boost cross-referenced items.
+            5. Apply memory decay based on age.
+            6. Deduplicate, sort by score descending, take top_k.
+            7. Optionally re-rank via LLM.
+            8. Format as structured Markdown.
         """
         vector_results, graph_results = await self._dual_retrieve(query)
 
         vector_entries = self._normalize_vector(vector_results)
-        graph_entries = self._normalize_graph(graph_results)
+        graph_entries = self._format_graph_entries(graph_results, query.task)
+
+        # Wire query_resolutions for error-related queries.
+        if _ERROR_PATTERN.search(query.task):
+            resolution_entries = await self._fetch_resolutions(query.task)
+            graph_entries.extend(resolution_entries)
+
+        # Min-max normalize each source independently.
+        vector_entries = _min_max_normalize(vector_entries)
+        graph_entries = _min_max_normalize(graph_entries)
 
         merged = self._merge_and_boost(vector_entries, graph_entries)
 
-        # Sort descending by score, take top_k.
+        # Apply memory decay.
+        self._apply_decay(merged)
+
+        # Sort descending by score, take top_k (or more for re-ranking).
         merged.sort(key=lambda e: e["score"], reverse=True)
+
+        # Re-ranking pass (gated behind config).
+        if self._settings.RERANK_ENABLED:
+            candidate_count = query.top_k * self._settings.RERANK_CANDIDATES_MULTIPLIER
+            candidates = merged[:candidate_count]
+            merged = await self._rerank(query.task, candidates)
+            merged.sort(key=lambda e: e["score"], reverse=True)
+
         merged = merged[: query.top_k]
 
-        context_block = self._format_markdown(merged)
+        context_block = self._format_markdown(merged, query.task, query.top_k)
         sources = [
             MemorySource(
                 store=entry["store"],
@@ -114,6 +190,59 @@ class RAGEngine:
         return vector_results, graph_results
 
     # ------------------------------------------------------------------
+    # Resolution retrieval
+    # ------------------------------------------------------------------
+
+    async def _fetch_resolutions(self, task: str) -> list[dict[str, Any]]:
+        """Query resolution nodes for error-related tasks.
+
+        Extracts keywords from the task and queries each against the graph's
+        query_resolutions method. Results are formatted as graph entries with
+        a 1.2x bonus score.
+        """
+        from app.db.graph import Neo4jClient as _NC
+
+        keywords = _NC._extract_keywords(task)
+        if not keywords:
+            return []
+
+        entries: list[dict[str, Any]] = []
+        for kw in keywords:
+            try:
+                results = await self._graph.query_resolutions(kw, limit=3)
+                for r in results:
+                    resolution = r.get("resolution") or ""
+                    error = r.get("error") or ""
+                    if not resolution:
+                        continue
+                    content = f"Resolution: {resolution}"
+                    if error:
+                        content = f"[Error: {error}] {content}"
+                    entries.append(
+                        {
+                            "content": content,
+                            "score": 1.2,  # bonus score (will be normalized)
+                            "store": "graph",
+                            "metadata": {
+                                "name": "resolution",
+                                "label": "Resolution",
+                                "source_type": "resolution",
+                            },
+                        }
+                    )
+            except Exception:
+                logger.exception("query_resolutions failed for keyword '%s'", kw)
+
+        # Deduplicate by content.
+        seen: set[str] = set()
+        unique: list[dict[str, Any]] = []
+        for e in entries:
+            if e["content"] not in seen:
+                seen.add(e["content"])
+                unique.append(e)
+        return unique
+
+    # ------------------------------------------------------------------
     # Score normalization
     # ------------------------------------------------------------------
 
@@ -140,15 +269,19 @@ class RAGEngine:
             )
         return entries
 
-    @staticmethod
-    def _normalize_graph(
+    def _format_graph_entries(
+        self,
         results: list[dict[str, Any]],
+        query: str,
     ) -> list[dict[str, Any]]:
         """Convert raw graph traversal results into scored entries.
 
-        Graph scores use ``1.0 / distance`` where *distance* is the path
-        length returned by Neo4j (number of hops, minimum 1).
+        Uses a composite score: weight * text_sim + (1 - weight) * (1/distance)
+        where text_sim is Jaccard token overlap between query and node text.
         """
+        weight = self._settings.GRAPH_RELEVANCE_WEIGHT
+        query_tokens = _tokenize(query)
+
         entries: list[dict[str, Any]] = []
         for r in results:
             name = r.get("name") or ""
@@ -161,7 +294,15 @@ class RAGEngine:
             if not content:
                 continue
 
-            score = 1.0 / max(int(distance), 1) if distance else 0.5
+            # Distance component: 1/distance, default 0.5 if no distance.
+            dist_score = 1.0 / max(int(distance), 1) if distance else 0.5
+
+            # Text similarity component: Jaccard on query vs name+description.
+            node_text = f"{name} {description}".strip()
+            node_tokens = _tokenize(node_text)
+            text_sim = _jaccard_similarity(query_tokens, node_tokens)
+
+            score = weight * text_sim + (1 - weight) * dist_score
 
             entries.append(
                 {
@@ -188,11 +329,13 @@ class RAGEngine:
     ) -> list[dict[str, Any]]:
         """Merge entries from both stores, boosting cross-referenced items.
 
-        For each pair of (vector_entry, graph_entry) whose text content has
-        a fuzzy overlap ratio > 0.7, the higher-scoring entry is kept with
-        its score multiplied by the boost factor and its store set to
-        ``"both"``.  The other entry is consumed (removed).
+        For each pair of (vector_entry, graph_entry) whose content matches
+        (via substring check or Jaccard similarity), the higher-scoring entry
+        is kept with its score multiplied by the boost factor and its store
+        set to ``"both"``.  The other entry is consumed (removed).
         """
+        boost_factor = self._settings.BOOST_FACTOR
+
         # Track which graph entries have been consumed by a cross-ref match.
         graph_consumed: set[int] = set()
         merged: list[dict[str, Any]] = []
@@ -205,7 +348,7 @@ class RAGEngine:
                 if self._is_fuzzy_match(v_entry["content"], g_entry["content"]):
                     # Cross-referenced: combine the best score with boost.
                     best_score = max(v_entry["score"], g_entry["score"])
-                    boosted_score = min(best_score * _CROSS_REF_BOOST, 1.0)
+                    boosted_score = min(best_score * boost_factor, 1.0)
 
                     merged.append(
                         {
@@ -241,72 +384,184 @@ class RAGEngine:
     def _is_fuzzy_match(a: str, b: str) -> bool:
         """Return True if the two strings are sufficiently similar.
 
-        Compares only the first 200 characters for performance, since
-        SequenceMatcher is O(N*M) on the full content strings.
+        Primary: case-insensitive substring check (either direction).
+        Fallback: Jaccard similarity on word token sets, threshold 0.3.
         """
         if not a or not b:
             return False
-        a_trimmed = a[:200].lower()
-        b_trimmed = b[:200].lower()
-        ratio = SequenceMatcher(None, a_trimmed, b_trimmed).ratio()
-        return ratio > _FUZZY_MATCH_THRESHOLD
+        a_lower = a.lower()
+        b_lower = b.lower()
+
+        # Primary: substring check (graph content in vector content or vice versa).
+        if b_lower in a_lower or a_lower in b_lower:
+            return True
+
+        # Fallback: Jaccard token similarity.
+        a_tokens = _tokenize(a)
+        b_tokens = _tokenize(b)
+        return _jaccard_similarity(a_tokens, b_tokens) >= _JACCARD_MATCH_THRESHOLD
+
+    # ------------------------------------------------------------------
+    # Memory decay
+    # ------------------------------------------------------------------
+
+    def _apply_decay(self, entries: list[dict[str, Any]]) -> None:
+        """Apply exponential memory decay based on entry age.
+
+        Formula: decayed_score = score * 2^(-age_days / half_life)
+        If half_life is 0 or entry has no timestamp, score is unchanged.
+        """
+        half_life = self._settings.MEMORY_DECAY_HALF_LIFE_DAYS
+        if half_life <= 0:
+            return
+
+        now = datetime.now(timezone.utc)
+        for entry in entries:
+            timestamp_str = entry.get("metadata", {}).get("timestamp")
+            if not timestamp_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(str(timestamp_str))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                age_days = (now - ts).total_seconds() / 86400.0
+                if age_days > 0:
+                    decay = 2.0 ** (-age_days / half_life)
+                    entry["score"] *= decay
+            except (ValueError, TypeError):
+                # Unparseable timestamp — skip decay for this entry.
+                continue
+
+    # ------------------------------------------------------------------
+    # Re-ranking via LLM
+    # ------------------------------------------------------------------
+
+    async def _rerank(
+        self,
+        task: str,
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Re-rank candidates by asking the LLM to score relevance.
+
+        Calls the configured LLM endpoint with a relevance scoring prompt.
+        If the call fails for any candidate, the original score is kept.
+        """
+        if not candidates:
+            return candidates
+
+        base_url = self._settings.LLM_BASE_URL
+        model = self._settings.LLM_MODEL
+        api_key = self._settings.LLM_API_KEY
+
+        url = f"{base_url}/chat/completions"
+        headers: dict[str, str] = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            tasks = [
+                self._rerank_single(client, url, headers, model, task, c)
+                for c in candidates
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        reranked: list[dict[str, Any]] = []
+        for candidate, result in zip(candidates, results):
+            if isinstance(result, float):
+                candidate["score"] = result
+            else:
+                if isinstance(result, Exception):
+                    logger.warning("Re-rank failed for entry: %s", result)
+                # Keep original score on failure.
+            reranked.append(candidate)
+
+        return reranked
+
+    @staticmethod
+    async def _rerank_single(
+        client: httpx.AsyncClient,
+        url: str,
+        headers: dict[str, str],
+        model: str,
+        task: str,
+        candidate: dict[str, Any],
+    ) -> float:
+        """Ask the LLM to score a single candidate's relevance to the task."""
+        prompt = (
+            "Rate the relevance of this memory to the task on a scale of 0-1. "
+            "Respond with ONLY a decimal number between 0 and 1.\n\n"
+            f"Task: {task}\n"
+            f"Memory: {candidate['content']}"
+        )
+        response = await client.post(
+            url,
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": 10,
+            },
+            headers=headers,
+        )
+        response.raise_for_status()
+        data = response.json()
+        text = data["choices"][0]["message"]["content"].strip()
+        # Extract the first float-like value from the response.
+        match = re.search(r"([01](?:\.\d+)?)", text)
+        if match:
+            return float(match.group(1))
+        return float(text)
 
     # ------------------------------------------------------------------
     # Markdown formatting
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _format_markdown(entries: list[dict[str, Any]]) -> str:
-        """Build a structured Markdown block for LLM system prompt injection."""
+    def _format_markdown(
+        entries: list[dict[str, Any]],
+        task: str = "",
+        top_k: int = 5,
+    ) -> str:
+        """Build a structured Markdown block for LLM system prompt injection.
+
+        Output format:
+            ## Memory Recall ({n} results, confidence: {high/medium/low})
+            1. [{score}] ({source}) {content}
+            ...
+            > Query: "{task}" | Top {top_k} results
+        """
         if not entries:
-            return "## Relevant Memory Context\n\nNo relevant memories found."
+            return "## Memory Recall (0 results, confidence: low)\n\nNo relevant memories found."
 
-        graph_lines: list[str] = []
-        vector_lines: list[str] = []
-        cross_lines: list[str] = []
+        # Determine confidence band from aggregate (max) score.
+        max_score = max(e["score"] for e in entries)
+        if max_score > 0.7:
+            confidence = "high"
+        elif max_score >= 0.4:
+            confidence = "medium"
+        else:
+            confidence = "low"
 
-        for entry in entries:
+        n = len(entries)
+        lines: list[str] = [
+            f"## Memory Recall ({n} result{'s' if n != 1 else ''}, confidence: {confidence})",
+            "",
+        ]
+
+        # Entries are already sorted by score descending.
+        for i, entry in enumerate(entries, 1):
             store = entry["store"]
             content = entry["content"]
             score = entry["score"]
-            meta = entry.get("metadata", {})
 
+            # Map internal store names to display labels.
+            source_label = store
             if store == "both":
-                graph_name = meta.get("graph_name", "")
-                ref = f" \u27f7 Graph: {graph_name}" if graph_name else ""
-                cross_lines.append(f"- [{score:.2f}] {content}{ref}")
-            elif store == "graph":
-                label = meta.get("label", "Entity")
-                name = meta.get("name", "")
-                header = f"**[{label}]** {name}" if name else f"**[{label}]**"
-                if content != name:
-                    graph_lines.append(f"- {header} \u2192 {content}")
-                else:
-                    graph_lines.append(f"- {header}")
-            else:  # vector
-                source = meta.get("source", "")
-                tags = meta.get("tags", [])
-                tag_str = ", ".join(tags) if tags else "none"
-                vector_lines.append(f"- [{score:.2f}] {content}")
-                vector_lines.append(
-                    f"  - Source: {source}, Tags: {tag_str}"
-                )
+                source_label = "graph+vector"
 
-        sections: list[str] = ["## Relevant Memory Context"]
+            lines.append(f"{i}. [{score:.0%}] ({source_label}) {content}")
 
-        if graph_lines:
-            sections.append("")
-            sections.append("### From Knowledge Graph")
-            sections.extend(graph_lines)
+        lines.append("")
+        lines.append(f'> Query: "{task}" | Top {top_k}')
 
-        if vector_lines:
-            sections.append("")
-            sections.append("### From Semantic Memory")
-            sections.extend(vector_lines)
-
-        if cross_lines:
-            sections.append("")
-            sections.append("### Cross-Referenced (High Confidence)")
-            sections.extend(cross_lines)
-
-        return "\n".join(sections)
+        return "\n".join(lines)

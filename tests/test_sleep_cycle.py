@@ -173,19 +173,25 @@ def _make_pipeline_mock(raw_items: list[str | None]) -> MagicMock:
 
 
 class TestProcessEventBatch:
+    """Tests for _process_batch / process_event_batch.
+
+    All tests patch _get_redis_client to inject a mock Redis client,
+    since the module caches the client at module-level.
+    """
+
     @patch("app.workers.sleep_cycle._write_to_neo4j")
     @patch("app.workers.sleep_cycle.httpx.post")
-    @patch("app.workers.sleep_cycle.redis.from_url")
-    def test_successful_batch(self, mock_redis_from_url, mock_httpx_post, mock_write_neo4j):
+    @patch("app.workers.sleep_cycle._get_redis_client")
+    def test_successful_batch(self, mock_get_redis, mock_httpx_post, mock_write_neo4j):
         # Setup Redis mock with pipeline pattern
         raw_events = [
             json.dumps({"source": "ci", "payload": {"build": "1"}}),
             json.dumps({"source": "ci", "payload": {"build": "2"}}),
         ]
         # Pipeline returns raw_events + None padding to fill REDIS_BATCH_SIZE
-        pipeline_results = raw_events + [None] * 8  # default REDIS_BATCH_SIZE is 10
+        pipeline_results = raw_events + [None] * 48  # default REDIS_BATCH_SIZE is 50
         mock_redis = _make_pipeline_mock(pipeline_results)
-        mock_redis_from_url.return_value = mock_redis
+        mock_get_redis.return_value = mock_redis
 
         # Setup LLM response mock
         llm_response = MagicMock()
@@ -221,38 +227,38 @@ class TestProcessEventBatch:
         assert result["edges"] == 1
         assert result["written"] == 2
 
-    @patch("app.workers.sleep_cycle.redis.from_url")
-    def test_empty_batch(self, mock_redis_from_url):
+    @patch("app.workers.sleep_cycle._get_redis_client")
+    def test_empty_batch(self, mock_get_redis):
         # All None results from pipeline = no events
-        mock_redis = _make_pipeline_mock([None] * 10)
-        mock_redis_from_url.return_value = mock_redis
+        mock_redis = _make_pipeline_mock([None] * 50)
+        mock_get_redis.return_value = mock_redis
 
         result = _process_batch()
         assert result["status"] == "empty"
         assert result["nodes"] == 0
 
     @patch("app.workers.sleep_cycle.httpx.post")
-    @patch("app.workers.sleep_cycle.redis.from_url")
-    def test_llm_http_error_sends_to_dlq(self, mock_redis_from_url, mock_httpx_post):
+    @patch("app.workers.sleep_cycle._get_redis_client")
+    def test_llm_http_error_sends_to_dlq(self, mock_get_redis, mock_httpx_post):
         import httpx
 
-        pipeline_results = ['{"event": 1}'] + [None] * 9
+        pipeline_results = ['{"event": 1}'] + [None] * 49
         mock_redis = _make_pipeline_mock(pipeline_results)
-        mock_redis_from_url.return_value = mock_redis
+        mock_get_redis.return_value = mock_redis
 
         mock_httpx_post.side_effect = httpx.HTTPError("LLM down")
 
         result = _process_batch()
         assert result["status"] == "llm_error"
-        # Items should be pushed to DLQ
+        # Items should be pushed to DLQ via the mock redis client
         mock_redis.lpush.assert_called()
 
     @patch("app.workers.sleep_cycle.httpx.post")
-    @patch("app.workers.sleep_cycle.redis.from_url")
-    def test_llm_parse_failure_sends_to_dlq(self, mock_redis_from_url, mock_httpx_post):
-        pipeline_results = ['{"event": 1}'] + [None] * 9
+    @patch("app.workers.sleep_cycle._get_redis_client")
+    def test_llm_parse_failure_sends_to_dlq(self, mock_get_redis, mock_httpx_post):
+        pipeline_results = ['{"event": 1}'] + [None] * 49
         mock_redis = _make_pipeline_mock(pipeline_results)
-        mock_redis_from_url.return_value = mock_redis
+        mock_get_redis.return_value = mock_redis
 
         llm_response = MagicMock()
         llm_response.raise_for_status = MagicMock()
@@ -266,11 +272,11 @@ class TestProcessEventBatch:
         mock_redis.lpush.assert_called()
 
     @patch("app.workers.sleep_cycle.httpx.post")
-    @patch("app.workers.sleep_cycle.redis.from_url")
-    def test_invalid_structure_sends_to_dlq(self, mock_redis_from_url, mock_httpx_post):
-        pipeline_results = ['{"event": 1}'] + [None] * 9
+    @patch("app.workers.sleep_cycle._get_redis_client")
+    def test_invalid_structure_sends_to_dlq(self, mock_get_redis, mock_httpx_post):
+        pipeline_results = ['{"event": 1}'] + [None] * 49
         mock_redis = _make_pipeline_mock(pipeline_results)
-        mock_redis_from_url.return_value = mock_redis
+        mock_get_redis.return_value = mock_redis
 
         llm_response = MagicMock()
         llm_response.raise_for_status = MagicMock()
@@ -289,12 +295,12 @@ class TestProcessEventBatch:
         assert result["status"] == "validation_error"
 
     @patch("app.workers.sleep_cycle.httpx.post")
-    @patch("app.workers.sleep_cycle.redis.from_url")
-    def test_empty_extraction(self, mock_redis_from_url, mock_httpx_post):
+    @patch("app.workers.sleep_cycle._get_redis_client")
+    def test_empty_extraction(self, mock_get_redis, mock_httpx_post):
         """LLM returns valid JSON but with no valid nodes/edges."""
-        pipeline_results = ['{"event": 1}'] + [None] * 9
+        pipeline_results = ['{"event": 1}'] + [None] * 49
         mock_redis = _make_pipeline_mock(pipeline_results)
-        mock_redis_from_url.return_value = mock_redis
+        mock_get_redis.return_value = mock_redis
 
         llm_response = MagicMock()
         llm_response.raise_for_status = MagicMock()
@@ -319,13 +325,13 @@ class TestProcessEventBatch:
 
     @patch("app.workers.sleep_cycle._write_to_neo4j")
     @patch("app.workers.sleep_cycle.httpx.post")
-    @patch("app.workers.sleep_cycle.redis.from_url")
+    @patch("app.workers.sleep_cycle._get_redis_client")
     def test_neo4j_write_failure_sends_to_dlq(
-        self, mock_redis_from_url, mock_httpx_post, mock_write_neo4j
+        self, mock_get_redis, mock_httpx_post, mock_write_neo4j
     ):
-        pipeline_results = ['{"event": 1}'] + [None] * 9
+        pipeline_results = ['{"event": 1}'] + [None] * 49
         mock_redis = _make_pipeline_mock(pipeline_results)
-        mock_redis_from_url.return_value = mock_redis
+        mock_get_redis.return_value = mock_redis
 
         llm_response = MagicMock()
         llm_response.raise_for_status = MagicMock()
@@ -351,14 +357,14 @@ class TestProcessEventBatch:
         mock_redis.lpush.assert_called()
 
     @patch("app.workers.sleep_cycle.httpx.post")
-    @patch("app.workers.sleep_cycle.redis.from_url")
-    def test_llm_call_format(self, mock_redis_from_url, mock_httpx_post):
+    @patch("app.workers.sleep_cycle._get_redis_client")
+    def test_llm_call_format(self, mock_get_redis, mock_httpx_post):
         """Verify the LLM API call uses the correct format."""
         pipeline_results = [
             json.dumps({"source": "ci", "payload": {"x": 1}}),
-        ] + [None] * 9
+        ] + [None] * 49
         mock_redis = _make_pipeline_mock(pipeline_results)
-        mock_redis_from_url.return_value = mock_redis
+        mock_get_redis.return_value = mock_redis
 
         # Make it fail on LLM so we can inspect the call
         import httpx
@@ -374,12 +380,12 @@ class TestProcessEventBatch:
         assert json_body["temperature"] == 0.1
         assert json_body["response_format"] == {"type": "json_object"}
 
-    @patch("app.workers.sleep_cycle.redis.from_url")
-    def test_malformed_event_json_handled(self, mock_redis_from_url):
+    @patch("app.workers.sleep_cycle._get_redis_client")
+    def test_malformed_event_json_handled(self, mock_get_redis):
         """Malformed JSON in Redis should not crash the batch."""
-        pipeline_results = ["not valid json"] + [None] * 9
+        pipeline_results = ["not valid json"] + [None] * 49
         mock_redis = _make_pipeline_mock(pipeline_results)
-        mock_redis_from_url.return_value = mock_redis
+        mock_get_redis.return_value = mock_redis
 
         import httpx
 

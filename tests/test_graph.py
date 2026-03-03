@@ -90,19 +90,22 @@ class TestEnsureDriver:
 
 
 class TestContentHash:
-    def test_deterministic(self):
-        h1 = Neo4jClient._content_hash("hello")
-        h2 = Neo4jClient._content_hash("hello")
+    def test_deterministic(self, settings):
+        client = Neo4jClient(settings)
+        h1 = client._content_hash("hello")
+        h2 = client._content_hash("hello")
         assert h1 == h2
 
-    def test_different_inputs_different_hashes(self):
-        h1 = Neo4jClient._content_hash("hello")
-        h2 = Neo4jClient._content_hash("world")
+    def test_different_inputs_different_hashes(self, settings):
+        client = Neo4jClient(settings)
+        h1 = client._content_hash("hello")
+        h2 = client._content_hash("world")
         assert h1 != h2
 
-    def test_returns_16_hex_chars(self):
-        h = Neo4jClient._content_hash("test")
-        assert len(h) == 16
+    def test_returns_configurable_hex_chars(self, settings):
+        client = Neo4jClient(settings)
+        h = client._content_hash("test")
+        assert len(h) == settings.CONTENT_HASH_LENGTH
         assert all(c in "0123456789abcdef" for c in h)
 
 
@@ -168,9 +171,9 @@ class TestMergeActionLog:
         assert call_kwargs["outcome"] == "Timeout fixed"
         assert call_kwargs["resolution"] == "Changed config"
         assert call_kwargs["tags"] == ["db", "perf"]
-        assert call_kwargs["action_id"] == Neo4jClient._content_hash("Increased pool")
-        assert call_kwargs["outcome_id"] == Neo4jClient._content_hash("Timeout fixed")
-        assert call_kwargs["resolution_id"] == Neo4jClient._content_hash("Changed config")
+        assert call_kwargs["action_id"] == client_with_driver._content_hash("Increased pool")
+        assert call_kwargs["outcome_id"] == client_with_driver._content_hash("Timeout fixed")
+        assert call_kwargs["resolution_id"] == client_with_driver._content_hash("Changed config")
 
     @pytest.mark.asyncio
     async def test_merge_action_log_without_resolution(self, client_with_driver):
@@ -324,8 +327,8 @@ class TestQueryRelated:
         assert results == []
 
     @pytest.mark.asyncio
-    async def test_query_related_builds_keyword_conditions(self, client_with_driver):
-        """Verify the Cypher query uses CONTAINS for keyword matching."""
+    async def test_query_related_builds_fulltext_query(self, client_with_driver):
+        """Verify the Cypher query uses fulltext index search."""
         session = client_with_driver._mock_session
 
         mock_result = MagicMock()
@@ -339,13 +342,13 @@ class TestQueryRelated:
 
         await client_with_driver.query_related("authentication timeout", limit=5)
 
-        # Verify the query was called with keyword parameters
+        # Verify the query was called with fulltext search
         call_args = session.run.call_args
         query = call_args[0][0]
-        assert "CONTAINS" in query
-        # Should have keyword params like kw0, kw1
+        assert "fulltext.queryNodes" in query
+        # Should have search_terms parameter
         call_kwargs = call_args.kwargs
-        assert "kw0" in call_kwargs
+        assert "search_terms" in call_kwargs
 
 
 # ---------------------------------------------------------------------------
