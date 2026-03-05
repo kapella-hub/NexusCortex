@@ -603,3 +603,50 @@ class TestParseRerankScore:
     def test_out_of_range_rejected(self):
         """No valid [0, 1] score can be extracted from '5.3'."""
         assert RAGEngine._parse_rerank_score("5.3") is None
+
+
+# ---------------------------------------------------------------------------
+# _apply_lifecycle_scoring
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycleScoring:
+    def test_active_memories_get_full_score(self, engine):
+        items = [{"score": 1.0, "content": "test", "metadata": {"status": "active"}}]
+        result = engine._apply_lifecycle_scoring(items)
+        assert result[0]["score"] == 1.0
+
+    def test_superseded_memories_penalized(self, engine):
+        items = [{"score": 1.0, "content": "test", "metadata": {"status": "superseded"}}]
+        result = engine._apply_lifecycle_scoring(items)
+        assert result[0]["score"] == 0.5
+
+    def test_deprecated_memories_heavily_penalized(self, engine):
+        items = [{"score": 1.0, "content": "test", "metadata": {"status": "deprecated"}}]
+        result = engine._apply_lifecycle_scoring(items)
+        assert result[0]["score"] == pytest.approx(0.1)
+
+    def test_archived_memories_excluded(self, engine):
+        items = [{"score": 1.0, "content": "test", "metadata": {"status": "archived"}}]
+        result = engine._apply_lifecycle_scoring(items)
+        assert len(result) == 0
+
+    def test_confidence_boosts_confirmed_memories(self, engine):
+        items = [{"score": 1.0, "content": "test", "metadata": {"status": "active", "confirmed_count": 4, "contradicted_count": 0}}]
+        result = engine._apply_lifecycle_scoring(items)
+        assert result[0]["score"] == 5.0  # (1+4)/(1+0) = 5
+
+    def test_confidence_penalizes_contradicted_memories(self, engine):
+        items = [{"score": 1.0, "content": "test", "metadata": {"status": "active", "confirmed_count": 0, "contradicted_count": 4}}]
+        result = engine._apply_lifecycle_scoring(items)
+        assert result[0]["score"] == pytest.approx(0.2)  # (1+0)/(1+4) = 0.2
+
+    def test_no_metadata_treated_as_active(self, engine):
+        items = [{"score": 0.8, "content": "test", "metadata": {}}]
+        result = engine._apply_lifecycle_scoring(items)
+        assert result[0]["score"] == 0.8
+
+    def test_superseded_by_annotation(self, engine):
+        items = [{"score": 1.0, "content": "test", "metadata": {"status": "superseded", "superseded_by": "new-id"}}]
+        result = engine._apply_lifecycle_scoring(items)
+        assert result[0]["_superseded_by"] == "new-id"

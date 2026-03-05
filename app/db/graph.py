@@ -824,6 +824,42 @@ class Neo4jClient:
             logger.error("Failed to export graph: %s", exc)
             return {"nodes": [], "edges": []}
 
+    async def create_supersession(self, newer_id: str, older_id: str, reason: str, detected: str = "auto") -> None:
+        """Create a SUPERSEDES edge between two action nodes."""
+        driver = self._ensure_driver()
+        async with driver.session() as session:
+            await session.run(
+                "MATCH (newer) WHERE elementId(newer) = $newer_id "
+                "MATCH (older) WHERE elementId(older) = $older_id "
+                "MERGE (newer)-[:SUPERSEDES {reason: $reason, detected: $detected, timestamp: datetime()}]->(older)",
+                newer_id=newer_id, older_id=older_id, reason=reason, detected=detected,
+            )
+
+    async def get_supersession_history(self, node_id: str) -> dict:
+        """Get the supersession chain for a node — what it supersedes and what supersedes it."""
+        driver = self._ensure_driver()
+        async with driver.session() as session:
+            # What this node supersedes (outgoing SUPERSEDES edges)
+            result = await session.run(
+                "MATCH (n)-[r:SUPERSEDES]->(older) WHERE elementId(n) = $node_id "
+                "RETURN elementId(older) AS id, older.action AS text, r.reason AS reason, r.detected AS detected",
+                node_id=node_id,
+            )
+            supersedes = [dict(record) async for record in result]
+
+            # What supersedes this node (incoming SUPERSEDES edges)
+            result2 = await session.run(
+                "MATCH (newer)-[r:SUPERSEDES]->(n) WHERE elementId(n) = $node_id "
+                "RETURN elementId(newer) AS id, newer.action AS text, r.reason AS reason, r.detected AS detected",
+                node_id=node_id,
+            )
+            superseded_by_list = [dict(record) async for record in result2]
+
+            return {
+                "supersedes": supersedes,
+                "superseded_by": superseded_by_list[0] if superseded_by_list else None,
+            }
+
     async def query_resolutions(
         self, error_pattern: str, limit: int = 5, namespace: str = "default"
     ) -> list[dict[str, Any]]:

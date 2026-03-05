@@ -344,6 +344,11 @@ class VectorClient:
                     for k, v in metadata.items()
                     if k not in {"source", "tags", "domain", "timestamp"}
                 },
+                "status": "active",
+                "confirmed_count": 0,
+                "contradicted_count": 0,
+                "last_confirmed_at": None,
+                "superseded_by": None,
             }
 
             await self._client.upsert(
@@ -370,6 +375,7 @@ class VectorClient:
         top_k: int = 5,
         filter_tags: list[str] | None = None,
         namespace: str = "default",
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
         """Embed query and search Qdrant for similar vectors.
 
@@ -386,6 +392,7 @@ class VectorClient:
             vector = await self._embed(query)
 
             filter_conditions = []
+            must_not_conditions = []
             if filter_tags:
                 filter_conditions.append(
                     FieldCondition(
@@ -400,7 +407,21 @@ class VectorClient:
                         match=MatchValue(value=namespace),
                     )
                 )
-            query_filter = Filter(must=filter_conditions) if filter_conditions else None
+            if not include_archived:
+                must_not_conditions.append(
+                    FieldCondition(
+                        key="status",
+                        match=MatchValue(value="archived"),
+                    )
+                )
+            query_filter = (
+                Filter(
+                    must=filter_conditions or None,
+                    must_not=must_not_conditions or None,
+                )
+                if filter_conditions or must_not_conditions
+                else None
+            )
 
             results = await self._client.query_points(
                 collection_name=self._collection,
@@ -606,6 +627,91 @@ class VectorClient:
     def clear_cache(self) -> None:
         """Clear the embedding cache."""
         self._embed_cache.clear()
+
+    # ------------------------------------------------------------------
+    # Knowledge lifecycle methods
+    # ------------------------------------------------------------------
+
+    async def update_status(self, memory_id: str, status: str, superseded_by: str | None = None) -> None:
+        """Update memory lifecycle status and optionally set superseded_by."""
+        payload: dict[str, Any] = {"status": status}
+        if superseded_by:
+            payload["superseded_by"] = superseded_by
+        if status == "superseded":
+            # Increment contradicted_count
+            points = await self._client.retrieve(self._collection, [memory_id], with_payload=True)
+            if points:
+                current = points[0].payload.get("contradicted_count", 0)
+                payload["contradicted_count"] = current + 1
+        await self._client.set_payload(
+            collection_name=self._collection,
+            payload=payload,
+            points=[memory_id],
+        )
+
+    async def confirm_memory(self, memory_id: str) -> bool:
+        """Confirm a memory is still valid — bump confirmed_count, update last_confirmed_at."""
+        points = await self._client.retrieve(self._collection, [memory_id], with_payload=True)
+        if not points:
+            return False
+        current_count = points[0].payload.get("confirmed_count", 0)
+        await self._client.set_payload(
+            collection_name=self._collection,
+            payload={
+                "confirmed_count": current_count + 1,
+                "last_confirmed_at": datetime.now(timezone.utc).isoformat(),
+            },
+            points=[memory_id],
+        )
+        return True
+
+    async def get_memory(self, memory_id: str) -> dict | None:
+        """Retrieve a single memory point with its payload."""
+        try:
+            points = await self._client.retrieve(self._collection, [memory_id], with_payload=True)
+        except Exception:
+            return None
+        if not points:
+            return None
+        p = points[0]
+        return {
+            "id": str(p.id),
+            "text": p.payload.get("text", ""),
+            "status": p.payload.get("status", "active"),
+            "confirmed_count": p.payload.get("confirmed_count", 0),
+            "contradicted_count": p.payload.get("contradicted_count", 0),
+            "last_confirmed_at": p.payload.get("last_confirmed_at"),
+            "superseded_by": p.payload.get("superseded_by"),
+            "metadata": {k: v for k, v in p.payload.items() if k not in ("text", "status", "confirmed_count", "contradicted_count", "last_confirmed_at", "superseded_by")},
+        }
+
+    async def find_similar(self, text: str, namespace: str = "default", domain: str | None = None, threshold: float = 0.85, top_k: int = 3) -> list[dict]:
+        """Find similar active memories for contradiction detection."""
+        embedding = await self._embed(text)
+        conditions = [FieldCondition(key="status", match=MatchValue(value="active"))]
+        if namespace != "default":
+            conditions.append(FieldCondition(key="namespace", match=MatchValue(value=namespace)))
+        if domain:
+            conditions.append(FieldCondition(key="domain", match=MatchValue(value=domain)))
+        results = await self._client.query_points(
+            collection_name=self._collection,
+            query=embedding,
+            query_filter=Filter(must=conditions),
+            limit=top_k,
+            with_payload=True,
+        )
+        matches = []
+        for point in results.points:
+            if point.score >= threshold:
+                matches.append({
+                    "id": str(point.id),
+                    "score": point.score,
+                    "text": point.payload.get("text", ""),
+                    "domain": point.payload.get("domain", ""),
+                    "namespace": point.payload.get("namespace", "default"),
+                    "metadata": point.payload,
+                })
+        return matches
 
     def _cache_put(self, key: str, value: list[float]) -> None:
         """Insert into the embedding cache with LRU eviction."""

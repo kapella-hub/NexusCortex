@@ -7,10 +7,15 @@ from pydantic import ValidationError
 
 from app.models import (
     ActionLog,
+    ConfirmRequest,
+    ConfirmResponse,
     ContextQuery,
+    DeprecateRequest,
+    DeprecateResponse,
     GenericEventIngest,
     HealthResponse,
     LearnResponse,
+    MemoryHistoryResponse,
     MemorySource,
     RecallResponse,
     ServiceStatus,
@@ -42,7 +47,7 @@ class TestContextQuery:
     def test_serialization_roundtrip(self):
         q = ContextQuery(task="Fix login bug", tags=["auth"], top_k=3)
         data = q.model_dump()
-        assert data == {"task": "Fix login bug", "tags": ["auth"], "top_k": 3, "namespace": "default"}
+        assert data == {"task": "Fix login bug", "tags": ["auth"], "top_k": 3, "namespace": "default", "include_archived": False}
         q2 = ContextQuery.model_validate(data)
         assert q2 == q
 
@@ -444,3 +449,183 @@ class TestNamespaceValidation:
         """LearnResponse should accept custom namespace."""
         lr = LearnResponse(status="stored", namespace="agent-2")
         assert lr.namespace == "agent-2"
+
+
+# ---------------------------------------------------------------------------
+# ContextQuery include_archived
+# ---------------------------------------------------------------------------
+
+
+class TestContextQueryIncludeArchived:
+    def test_default_false(self):
+        q = ContextQuery(task="test")
+        assert q.include_archived is False
+
+    def test_set_true(self):
+        q = ContextQuery(task="test", include_archived=True)
+        assert q.include_archived is True
+
+
+# ---------------------------------------------------------------------------
+# LearnResponse superseded
+# ---------------------------------------------------------------------------
+
+
+class TestLearnResponseSuperseded:
+    def test_default_empty(self):
+        lr = LearnResponse(status="stored")
+        assert lr.superseded == []
+
+    def test_with_superseded_ids(self):
+        lr = LearnResponse(status="stored", superseded=["id1", "id2"])
+        assert lr.superseded == ["id1", "id2"]
+
+
+# ---------------------------------------------------------------------------
+# DeprecateRequest
+# ---------------------------------------------------------------------------
+
+
+class TestDeprecateRequest:
+    def test_valid_creation(self):
+        req = DeprecateRequest(
+            memory_ids=["m1", "m2"],
+            status="deprecated",
+            reason="Outdated information",
+        )
+        assert req.memory_ids == ["m1", "m2"]
+        assert req.status == "deprecated"
+        assert req.reason == "Outdated information"
+        assert req.superseded_by is None
+
+    def test_superseded_status_with_superseded_by(self):
+        req = DeprecateRequest(
+            memory_ids=["m1"],
+            status="superseded",
+            reason="Replaced by newer version",
+            superseded_by="m2",
+        )
+        assert req.status == "superseded"
+        assert req.superseded_by == "m2"
+
+    def test_archived_status(self):
+        req = DeprecateRequest(
+            memory_ids=["m1"],
+            status="archived",
+            reason="No longer relevant",
+        )
+        assert req.status == "archived"
+
+    def test_invalid_status_rejected(self):
+        with pytest.raises(ValidationError):
+            DeprecateRequest(
+                memory_ids=["m1"],
+                status="invalid",
+                reason="test",
+            )
+
+    def test_empty_memory_ids_rejected(self):
+        with pytest.raises(ValidationError):
+            DeprecateRequest(
+                memory_ids=[],
+                status="deprecated",
+                reason="test",
+            )
+
+    def test_too_many_memory_ids_rejected(self):
+        with pytest.raises(ValidationError):
+            DeprecateRequest(
+                memory_ids=[f"m{i}" for i in range(51)],
+                status="deprecated",
+                reason="test",
+            )
+
+    def test_empty_reason_rejected(self):
+        with pytest.raises(ValidationError):
+            DeprecateRequest(
+                memory_ids=["m1"],
+                status="deprecated",
+                reason="",
+            )
+
+    def test_reason_too_long_rejected(self):
+        with pytest.raises(ValidationError):
+            DeprecateRequest(
+                memory_ids=["m1"],
+                status="deprecated",
+                reason="x" * 2001,
+            )
+
+
+# ---------------------------------------------------------------------------
+# ConfirmRequest
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmRequest:
+    def test_valid_creation(self):
+        req = ConfirmRequest(memory_ids=["m1", "m2"])
+        assert req.memory_ids == ["m1", "m2"]
+
+    def test_empty_memory_ids_rejected(self):
+        with pytest.raises(ValidationError):
+            ConfirmRequest(memory_ids=[])
+
+    def test_too_many_memory_ids_rejected(self):
+        with pytest.raises(ValidationError):
+            ConfirmRequest(memory_ids=[f"m{i}" for i in range(51)])
+
+
+# ---------------------------------------------------------------------------
+# MemoryHistoryResponse
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryHistoryResponse:
+    def test_minimal_creation(self):
+        resp = MemoryHistoryResponse(
+            memory_id="m1",
+            status="active",
+        )
+        assert resp.memory_id == "m1"
+        assert resp.status == "active"
+        assert resp.superseded_by is None
+        assert resp.supersedes == []
+        assert resp.confirmed_count == 0
+        assert resp.contradicted_count == 0
+        assert resp.last_confirmed_at is None
+
+    def test_full_creation(self):
+        resp = MemoryHistoryResponse(
+            memory_id="m1",
+            status="superseded",
+            superseded_by={"id": "m2", "text": "newer version"},
+            supersedes=[{"id": "m0", "text": "older version"}],
+            confirmed_count=5,
+            contradicted_count=2,
+            last_confirmed_at="2026-03-05T12:00:00+00:00",
+        )
+        assert resp.superseded_by == {"id": "m2", "text": "newer version"}
+        assert len(resp.supersedes) == 1
+        assert resp.confirmed_count == 5
+        assert resp.contradicted_count == 2
+        assert resp.last_confirmed_at == "2026-03-05T12:00:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# DeprecateResponse / ConfirmResponse
+# ---------------------------------------------------------------------------
+
+
+class TestDeprecateResponse:
+    def test_valid(self):
+        resp = DeprecateResponse(status="ok", updated=3)
+        assert resp.status == "ok"
+        assert resp.updated == 3
+
+
+class TestConfirmResponse:
+    def test_valid(self):
+        resp = ConfirmResponse(status="ok", confirmed=2)
+        assert resp.status == "ok"
+        assert resp.confirmed == 2

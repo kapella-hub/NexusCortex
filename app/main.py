@@ -25,11 +25,13 @@ from slowapi.util import get_remote_address
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.config import get_settings
+from app.contradiction import detect_and_supersede
 from app.dashboard import create_dashboard_router
 from app.db.graph import Neo4jClient
 from app.db.vector import VectorClient
 from app.embedding_admin import create_embedding_router
 from app.engine.rag import RAGEngine
+from app.lifecycle import create_lifecycle_router
 from app.exceptions import (
     GraphConnectionError,
     LLMExtractionError,
@@ -124,6 +126,10 @@ async def lifespan(app: FastAPI):
         vector=app.state.vector_client,
     ))
     app.include_router(create_embedding_router(app.state.vector_client))
+    app.include_router(create_lifecycle_router(
+        graph=app.state.graph_client,
+        vector=app.state.vector_client,
+    ))
 
     yield
 
@@ -525,17 +531,38 @@ async def memory_learn(
             namespace=log.namespace,
         )
 
+    # Contradiction detection — auto-supersede similar old memories
+    superseded: list[str] = []
+    try:
+        superseded = await detect_and_supersede(
+            vector=vector,
+            graph=graph,
+            new_text=text,
+            new_vector_id=str(vector_result),
+            new_graph_id=str(graph_result),
+            domain=log.domain,
+            namespace=log.namespace,
+        )
+    except Exception:
+        logger.warning("Contradiction detection failed, continuing")
+
     # Fire webhooks in background (best-effort)
     try:
         asyncio.create_task(fire_webhooks(
             redis_client, "memory.learned",
-            {"graph_id": graph_result, "vector_id": vector_result, "action": log.action},
+            {"graph_id": graph_result, "vector_id": vector_result, "action": log.action, "superseded": superseded},
             namespace=log.namespace,
         ))
     except Exception:
         pass
 
-    return LearnResponse(status="stored", graph_id=graph_result, vector_id=vector_result, namespace=log.namespace)
+    return LearnResponse(
+        status="stored",
+        graph_id=graph_result,
+        vector_id=vector_result,
+        namespace=log.namespace,
+        superseded=superseded,
+    )
 
 
 @app.post("/memory/stream", response_model=StreamResponse)

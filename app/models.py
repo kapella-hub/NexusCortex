@@ -18,6 +18,7 @@ class ContextQuery(BaseModel):
     tags: list[Annotated[str, Field(max_length=100)]] = Field(default=[], max_length=20)
     top_k: int = Field(default=5, ge=1, le=100)
     namespace: str = Field(default="default", min_length=1, max_length=200, pattern=r"^[a-zA-Z0-9_-]+$")
+    include_archived: bool = Field(default=False)
 
     model_config = {
         "json_schema_extra": {
@@ -132,6 +133,7 @@ class LearnResponse(BaseModel):
     graph_id: str | None = None
     vector_id: str | None = None
     namespace: str = "default"
+    superseded: list[str] = []
 
 
 class StreamResponse(BaseModel):
@@ -214,3 +216,49 @@ class ImportResponse(BaseModel):
     imported_nodes: int = 0
     imported_edges: int = 0
     errors: list[str] = []
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Lifecycle Models
+# ---------------------------------------------------------------------------
+
+
+class DeprecateRequest(BaseModel):
+    """Request to change memory status."""
+
+    memory_ids: list[str] = Field(..., min_length=1, max_length=50)
+    status: Literal["deprecated", "superseded", "archived"] = Field(...)
+    reason: str = Field(..., min_length=1, max_length=2000)
+    superseded_by: str | None = Field(default=None)
+
+
+class DeprecateResponse(BaseModel):
+    """Response from /memory/deprecate."""
+
+    status: str
+    updated: int
+
+
+class ConfirmRequest(BaseModel):
+    """Request to confirm memories are still valid."""
+
+    memory_ids: list[str] = Field(..., min_length=1, max_length=50)
+
+
+class ConfirmResponse(BaseModel):
+    """Response from /memory/confirm."""
+
+    status: str
+    confirmed: int
+
+
+class MemoryHistoryResponse(BaseModel):
+    """Response from /memory/{id}/history."""
+
+    memory_id: str
+    status: str
+    superseded_by: dict | None = None
+    supersedes: list[dict] = []
+    confirmed_count: int = 0
+    contradicted_count: int = 0
+    last_confirmed_at: str | None = None

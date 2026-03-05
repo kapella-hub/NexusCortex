@@ -31,6 +31,8 @@ app/
 ├── transfer.py        # Export/import API (JSONL streaming)
 ├── streaming.py       # SSE streaming recall endpoint
 ├── embedding_admin.py # Embedding model admin (status, re-embed)
+├── lifecycle.py       # Knowledge lifecycle (deprecate, confirm, history)
+├── contradiction.py   # Automatic contradiction detection & supersession
 ├── static/
 │   └── dashboard.html # Self-contained dashboard SPA (zero dependencies)
 ├── db/
@@ -58,6 +60,9 @@ app/
 - `POST /webhooks/` — Register webhook callbacks for memory events
 - `GET /admin/embeddings/status` — Embedding model info and cache stats
 - `POST /admin/embeddings/reembed` — Trigger re-embedding with progress tracking
+- `POST /memory/deprecate` — Change memory status (deprecated, superseded, archived)
+- `POST /memory/confirm` — Confirm memories are still valid (bumps confidence)
+- `GET /memory/{id}/history` — Get supersession chain for a memory
 
 ### MCP Server (port 8080)
 Exposes 4 MCP tools via Streamable HTTP (`/mcp` endpoint):
@@ -68,12 +73,12 @@ Exposes 4 MCP tools via Streamable HTTP (`/mcp` endpoint):
 
 ### Data Flow
 - `/recall` → RAG engine queries Qdrant (semantic) + Neo4j (graph) concurrently → merges/boosts scores → Markdown
-- `/learn` → writes action chain to Neo4j (Domain→Action→Outcome→Resolution) + embeds to Qdrant
+- `/learn` → writes action chain to Neo4j (Domain→Action→Outcome→Resolution) + embeds to Qdrant → contradiction detection auto-supersedes stale memories
 - `/stream` → LPUSH to Redis → Celery Beat (60s) → LLM extraction → Neo4j MERGE
 
 ### Graph Schema
 - **Nodes**: Namespace, Domain, Concept, Action, Outcome, Resolution, EventStream
-- **Edges**: CONTAINS, RELATES_TO, CAUSED, RESOLVED_BY, UTILIZES
+- **Edges**: CONTAINS, RELATES_TO, CAUSED, RESOLVED_BY, UTILIZES, SUPERSEDES
 
 ## Commands
 
@@ -154,6 +159,11 @@ All configuration via environment variables or `.env` file. See `.env.example` f
 - **Embedding hot-swap**: Re-embed all vectors with progress tracking via Celery task state
 - **MCP client lock**: `asyncio.Lock` guards lazy client initialization against TOCTOU races
 - **Lucene phrase search**: Bigrams wrapped in double quotes for correct Lucene phrase matching
+- **Knowledge lifecycle**: Memory states (active/superseded/deprecated/archived) with status multipliers in recall scoring
+- **Contradiction detection**: Automatic on `/learn` — embeds new action, finds >0.85 similarity matches, auto-supersedes stale memories
+- **Confidence scoring**: `(1 + confirmed_count) / (1 + contradicted_count)` factor in recall scoring
+- **Supersession chains**: `SUPERSEDES` edges in Neo4j track knowledge evolution history
+- **Lifecycle scoring**: `final_score = base_score * status_multiplier * confidence_factor` (active=1.0, superseded=0.5, deprecated=0.1, archived=0.0)
 
 ## Development Practices
 
@@ -167,3 +177,4 @@ All configuration via environment variables or `.env` file. See `.env.example` f
 - `docs/ARCHITECTURE.md` — Full architecture specification with module contracts
 - `docs/SECURITY_REVIEW.md` — Security review findings and fixes
 - `docs/plans/2026-03-05-major-improvements.md` — v0.5.0 implementation plan (15 fixes)
+- `docs/plans/2026-03-05-knowledge-lifecycle-design.md` — Knowledge lifecycle design document

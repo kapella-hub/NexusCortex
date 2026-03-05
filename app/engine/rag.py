@@ -77,6 +77,13 @@ def _min_max_normalize(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
 class RAGEngine:
     """Dual-retrieval cognitive engine combining graph and vector search."""
 
+    STATUS_MULTIPLIERS = {
+        "active": 1.0,
+        "superseded": 0.5,
+        "deprecated": 0.1,
+        "archived": 0.0,
+    }
+
     def __init__(
         self,
         graph: Neo4jClient,
@@ -120,6 +127,9 @@ class RAGEngine:
 
         # Apply memory decay.
         self._apply_decay(merged)
+
+        # Apply lifecycle scoring (status + confidence multipliers).
+        merged = self._apply_lifecycle_scoring(merged)
 
         # Sort descending by score, take top_k (or more for re-ranking).
         merged.sort(key=lambda e: e["score"], reverse=True)
@@ -177,6 +187,7 @@ class RAGEngine:
                     top_k=query.top_k,
                     filter_tags=query.tags or None,
                     namespace=getattr(query, "namespace", "default"),
+                    include_archived=getattr(query, "include_archived", False),
                 )
                 return "vector", results
             except Exception:
@@ -268,6 +279,7 @@ class RAGEngine:
                     top_k=query.top_k,
                     filter_tags=query.tags or None,
                     namespace=getattr(query, "namespace", "default"),
+                    include_archived=getattr(query, "include_archived", False),
                 )
             except Exception:
                 logger.exception("Vector search failed")
@@ -532,6 +544,48 @@ class RAGEngine:
                 continue
 
     # ------------------------------------------------------------------
+    # Lifecycle scoring
+    # ------------------------------------------------------------------
+
+    def _apply_lifecycle_scoring(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Apply lifecycle status and confidence multipliers to scored items.
+
+        Each item's score is adjusted by:
+          score * status_multiplier * confidence_factor
+
+        Where confidence_factor = (1 + confirmed_count) / (1 + contradicted_count)
+
+        Items with status="archived" are removed entirely (score=0).
+        Items are annotated with lifecycle metadata for the context block.
+        """
+        result = []
+        for item in items:
+            metadata = item.get("metadata", {})
+            status = metadata.get("status", "active")
+
+            # Status multiplier
+            multiplier = self.STATUS_MULTIPLIERS.get(status, 1.0)
+            if multiplier == 0.0:
+                continue  # Skip archived
+
+            # Confidence factor
+            confirmed = metadata.get("confirmed_count", 0)
+            contradicted = metadata.get("contradicted_count", 0)
+            confidence = (1 + confirmed) / (1 + contradicted)
+
+            item["score"] = item["score"] * multiplier * confidence
+
+            # Annotate for context block
+            if status != "active":
+                item["_lifecycle_status"] = status
+            if metadata.get("superseded_by"):
+                item["_superseded_by"] = metadata["superseded_by"]
+
+            result.append(item)
+
+        return result
+
+    # ------------------------------------------------------------------
     # Re-ranking via LLM
     # ------------------------------------------------------------------
 
@@ -677,7 +731,16 @@ class RAGEngine:
             if store == "both":
                 source_label = "graph+vector"
 
-            lines.append(f"{i}. [{score:.0%}] ({source_label}) {content}")
+            # Lifecycle status label.
+            status_label = ""
+            lifecycle_status = entry.get("_lifecycle_status")
+            if lifecycle_status:
+                status_label = f" [{lifecycle_status.upper()}]"
+            superseded_by = entry.get("_superseded_by")
+            if superseded_by:
+                status_label += f" (superseded by {superseded_by})"
+
+            lines.append(f"{i}. [{score:.0%}] ({source_label}) {content}{status_label}")
 
         lines.append("")
         lines.append(f'> Query: "{task}" | Top {top_k}')

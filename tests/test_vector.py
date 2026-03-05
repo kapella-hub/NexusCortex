@@ -212,9 +212,12 @@ class TestSearch:
         assert results[0]["metadata"]["source"] == "action_log"
         assert results[0]["metadata"]["extra"] == "val"
 
-        # Verify no filter was passed
+        # Verify only the archived exclusion filter was passed (no must conditions)
         call_kwargs = mock_qdrant_client.query_points.call_args.kwargs
-        assert call_kwargs["query_filter"] is None
+        query_filter = call_kwargs["query_filter"]
+        assert query_filter is not None
+        assert query_filter.must is None
+        assert query_filter.must_not is not None
         assert call_kwargs["limit"] == 3
 
     @pytest.mark.asyncio
@@ -578,7 +581,7 @@ class TestNamespaceSupport:
 
     @pytest.mark.asyncio
     async def test_search_default_namespace_no_filter(self, vector_client, mock_qdrant_client):
-        """search with default namespace should NOT add namespace filter."""
+        """search with default namespace should NOT add namespace filter (only archived exclusion)."""
         result_obj = MagicMock()
         result_obj.points = []
         mock_qdrant_client.query_points.return_value = result_obj
@@ -589,7 +592,12 @@ class TestNamespaceSupport:
             await vector_client.search("auth bug", top_k=5, namespace="default")
 
         call_kwargs = mock_qdrant_client.query_points.call_args.kwargs
-        assert call_kwargs["query_filter"] is None
+        query_filter = call_kwargs["query_filter"]
+        # Should have must_not for archived but no must conditions for namespace
+        assert query_filter is not None
+        assert query_filter.must is None
+        ns_conditions = [c for c in (query_filter.must or []) if c.key == "namespace"]
+        assert len(ns_conditions) == 0
 
     @pytest.mark.asyncio
     async def test_search_namespace_combined_with_tags(self, vector_client, mock_qdrant_client):
@@ -611,3 +619,259 @@ class TestNamespaceSupport:
         assert len(query_filter.must) == 2
         keys = {c.key for c in query_filter.must}
         assert keys == {"tags", "namespace"}
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle: update_status
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateStatus:
+    @pytest.mark.asyncio
+    async def test_update_status_sets_status(self, vector_client, mock_qdrant_client):
+        """update_status should set the status field on the point."""
+        mock_qdrant_client.set_payload = AsyncMock()
+
+        await vector_client.update_status("point-1", "deprecated")
+
+        mock_qdrant_client.set_payload.assert_called_once_with(
+            collection_name="test_collection",
+            payload={"status": "deprecated"},
+            points=["point-1"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_status_sets_superseded_by(self, vector_client, mock_qdrant_client):
+        """update_status with superseded_by should include it in the payload."""
+        mock_qdrant_client.set_payload = AsyncMock()
+        mock_qdrant_client.retrieve = AsyncMock(return_value=[])
+
+        await vector_client.update_status("point-1", "archived", superseded_by="point-2")
+
+        call_kwargs = mock_qdrant_client.set_payload.call_args.kwargs
+        assert call_kwargs["payload"]["status"] == "archived"
+        assert call_kwargs["payload"]["superseded_by"] == "point-2"
+
+    @pytest.mark.asyncio
+    async def test_update_status_superseded_increments_contradicted_count(self, vector_client, mock_qdrant_client):
+        """update_status with status=superseded should increment contradicted_count."""
+        mock_point = MagicMock()
+        mock_point.payload = {"contradicted_count": 3}
+        mock_qdrant_client.retrieve = AsyncMock(return_value=[mock_point])
+        mock_qdrant_client.set_payload = AsyncMock()
+
+        await vector_client.update_status("point-1", "superseded", superseded_by="point-2")
+
+        call_kwargs = mock_qdrant_client.set_payload.call_args.kwargs
+        assert call_kwargs["payload"]["contradicted_count"] == 4
+        assert call_kwargs["payload"]["status"] == "superseded"
+        assert call_kwargs["payload"]["superseded_by"] == "point-2"
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle: confirm_memory
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmMemory:
+    @pytest.mark.asyncio
+    async def test_confirm_memory_increments_count_and_sets_timestamp(self, vector_client, mock_qdrant_client):
+        """confirm_memory should bump confirmed_count and update last_confirmed_at."""
+        mock_point = MagicMock()
+        mock_point.payload = {"confirmed_count": 2}
+        mock_qdrant_client.retrieve = AsyncMock(return_value=[mock_point])
+        mock_qdrant_client.set_payload = AsyncMock()
+
+        result = await vector_client.confirm_memory("point-1")
+
+        assert result is True
+        call_kwargs = mock_qdrant_client.set_payload.call_args.kwargs
+        assert call_kwargs["payload"]["confirmed_count"] == 3
+        assert "last_confirmed_at" in call_kwargs["payload"]
+        assert call_kwargs["payload"]["last_confirmed_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_confirm_memory_returns_false_for_missing(self, vector_client, mock_qdrant_client):
+        """confirm_memory should return False when the point doesn't exist."""
+        mock_qdrant_client.retrieve = AsyncMock(return_value=[])
+
+        result = await vector_client.confirm_memory("nonexistent")
+
+        assert result is False
+        mock_qdrant_client.set_payload.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle: get_memory
+# ---------------------------------------------------------------------------
+
+
+class TestGetMemory:
+    @pytest.mark.asyncio
+    async def test_get_memory_returns_correct_fields(self, vector_client, mock_qdrant_client):
+        """get_memory should return a dict with lifecycle fields."""
+        mock_point = MagicMock()
+        mock_point.id = "point-1"
+        mock_point.payload = {
+            "text": "some text",
+            "status": "active",
+            "confirmed_count": 5,
+            "contradicted_count": 1,
+            "last_confirmed_at": "2026-03-05T12:00:00Z",
+            "superseded_by": None,
+            "domain": "general",
+            "tags": ["auth"],
+        }
+        mock_qdrant_client.retrieve = AsyncMock(return_value=[mock_point])
+
+        result = await vector_client.get_memory("point-1")
+
+        assert result is not None
+        assert result["id"] == "point-1"
+        assert result["text"] == "some text"
+        assert result["status"] == "active"
+        assert result["confirmed_count"] == 5
+        assert result["contradicted_count"] == 1
+        assert result["last_confirmed_at"] == "2026-03-05T12:00:00Z"
+        assert result["superseded_by"] is None
+        assert "domain" in result["metadata"]
+        assert "tags" in result["metadata"]
+
+    @pytest.mark.asyncio
+    async def test_get_memory_returns_none_for_missing(self, vector_client, mock_qdrant_client):
+        """get_memory should return None when the point doesn't exist."""
+        mock_qdrant_client.retrieve = AsyncMock(return_value=[])
+
+        result = await vector_client.get_memory("nonexistent")
+
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle: find_similar
+# ---------------------------------------------------------------------------
+
+
+class TestFindSimilar:
+    @pytest.mark.asyncio
+    async def test_find_similar_filters_by_status_active_and_threshold(self, vector_client, mock_qdrant_client):
+        """find_similar should filter by status=active and respect threshold."""
+        point_high = MagicMock()
+        point_high.id = "p1"
+        point_high.score = 0.90
+        point_high.payload = {"text": "high match", "domain": "general", "namespace": "default"}
+
+        point_low = MagicMock()
+        point_low.id = "p2"
+        point_low.score = 0.50
+        point_low.payload = {"text": "low match", "domain": "general", "namespace": "default"}
+
+        result_obj = MagicMock()
+        result_obj.points = [point_high, point_low]
+        mock_qdrant_client.query_points.return_value = result_obj
+
+        with patch.object(
+            vector_client, "_embed", new_callable=AsyncMock, return_value=[0.1] * 768
+        ):
+            results = await vector_client.find_similar("test text", threshold=0.85)
+
+        assert len(results) == 1
+        assert results[0]["id"] == "p1"
+        assert results[0]["score"] == 0.90
+
+        # Verify filter includes status=active
+        call_kwargs = mock_qdrant_client.query_points.call_args.kwargs
+        query_filter = call_kwargs["query_filter"]
+        status_conditions = [c for c in query_filter.must if c.key == "status"]
+        assert len(status_conditions) == 1
+        assert status_conditions[0].match.value == "active"
+
+    @pytest.mark.asyncio
+    async def test_find_similar_filters_by_domain(self, vector_client, mock_qdrant_client):
+        """find_similar with domain should include domain filter."""
+        result_obj = MagicMock()
+        result_obj.points = []
+        mock_qdrant_client.query_points.return_value = result_obj
+
+        with patch.object(
+            vector_client, "_embed", new_callable=AsyncMock, return_value=[0.1] * 768
+        ):
+            await vector_client.find_similar("test", domain="infra")
+
+        call_kwargs = mock_qdrant_client.query_points.call_args.kwargs
+        query_filter = call_kwargs["query_filter"]
+        domain_conditions = [c for c in query_filter.must if c.key == "domain"]
+        assert len(domain_conditions) == 1
+        assert domain_conditions[0].match.value == "infra"
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle fields in upsert
+# ---------------------------------------------------------------------------
+
+
+class TestUpsertLifecycleFields:
+    @pytest.mark.asyncio
+    async def test_upsert_includes_lifecycle_fields(self, vector_client, mock_qdrant_client):
+        """upsert should include status, confirmed_count, contradicted_count, etc."""
+        embed_vector = [0.1] * 768
+
+        with patch.object(
+            vector_client, "_embed", new_callable=AsyncMock, return_value=embed_vector
+        ):
+            await vector_client.upsert(
+                text="Test memory",
+                metadata={"source": "test", "tags": [], "domain": "general"},
+            )
+
+        call_kwargs = mock_qdrant_client.upsert.call_args.kwargs
+        payload = call_kwargs["points"][0].payload
+        assert payload["status"] == "active"
+        assert payload["confirmed_count"] == 0
+        assert payload["contradicted_count"] == 0
+        assert payload["last_confirmed_at"] is None
+        assert payload["superseded_by"] is None
+
+
+# ---------------------------------------------------------------------------
+# Search excludes archived
+# ---------------------------------------------------------------------------
+
+
+class TestSearchExcludesArchived:
+    @pytest.mark.asyncio
+    async def test_search_excludes_archived_by_default(self, vector_client, mock_qdrant_client):
+        """search should add must_not filter for status=archived by default."""
+        result_obj = MagicMock()
+        result_obj.points = []
+        mock_qdrant_client.query_points.return_value = result_obj
+
+        with patch.object(
+            vector_client, "_embed", new_callable=AsyncMock, return_value=[0.1] * 768
+        ):
+            await vector_client.search("test query")
+
+        call_kwargs = mock_qdrant_client.query_points.call_args.kwargs
+        query_filter = call_kwargs["query_filter"]
+        assert query_filter is not None
+        assert query_filter.must_not is not None
+        archived_conditions = [c for c in query_filter.must_not if c.key == "status"]
+        assert len(archived_conditions) == 1
+        assert archived_conditions[0].match.value == "archived"
+
+    @pytest.mark.asyncio
+    async def test_search_includes_archived_when_requested(self, vector_client, mock_qdrant_client):
+        """search with include_archived=True should not exclude archived."""
+        result_obj = MagicMock()
+        result_obj.points = []
+        mock_qdrant_client.query_points.return_value = result_obj
+
+        with patch.object(
+            vector_client, "_embed", new_callable=AsyncMock, return_value=[0.1] * 768
+        ):
+            await vector_client.search("test query", include_archived=True)
+
+        call_kwargs = mock_qdrant_client.query_points.call_args.kwargs
+        query_filter = call_kwargs["query_filter"]
+        # No filter at all for default namespace + no tags + include_archived
+        assert query_filter is None

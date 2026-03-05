@@ -535,3 +535,111 @@ class TestNamespaceSupport:
         query = call_args[0][0]
         # Should NOT contain namespace filter for default
         assert "Namespace {name:" not in query
+
+
+# ---------------------------------------------------------------------------
+# Supersession
+# ---------------------------------------------------------------------------
+
+
+class TestCreateSupersession:
+    @pytest.mark.asyncio
+    async def test_creates_supersedes_edge(self, client_with_driver):
+        """create_supersession should run a MERGE for the SUPERSEDES edge."""
+        session = client_with_driver._mock_session
+        session.run = AsyncMock()
+
+        await client_with_driver.create_supersession(
+            newer_id="elem-new",
+            older_id="elem-old",
+            reason="Newer approach replaces old one",
+            detected="manual",
+        )
+
+        session.run.assert_called_once()
+        call_args = session.run.call_args
+        query = call_args[0][0]
+        assert "SUPERSEDES" in query
+        assert "MERGE" in query
+        call_kwargs = call_args.kwargs
+        assert call_kwargs["newer_id"] == "elem-new"
+        assert call_kwargs["older_id"] == "elem-old"
+        assert call_kwargs["reason"] == "Newer approach replaces old one"
+        assert call_kwargs["detected"] == "manual"
+
+    @pytest.mark.asyncio
+    async def test_create_supersession_default_detected(self, client_with_driver):
+        """create_supersession should default detected to 'auto'."""
+        session = client_with_driver._mock_session
+        session.run = AsyncMock()
+
+        await client_with_driver.create_supersession(
+            newer_id="elem-new",
+            older_id="elem-old",
+            reason="Auto-detected contradiction",
+        )
+
+        call_kwargs = session.run.call_args.kwargs
+        assert call_kwargs["detected"] == "auto"
+
+
+class TestGetSupersessionHistory:
+    @pytest.mark.asyncio
+    async def test_returns_correct_chain(self, client_with_driver):
+        """get_supersession_history should return supersedes list and superseded_by dict."""
+        session = client_with_driver._mock_session
+
+        # First call: outgoing SUPERSEDES
+        supersedes_record = {"id": "elem-old", "text": "old action", "reason": "outdated", "detected": "auto"}
+        mock_result1 = MagicMock()
+
+        async def _aiter1():
+            yield supersedes_record
+
+        mock_result1.__aiter__ = lambda self: _aiter1()
+
+        # Second call: incoming SUPERSEDES
+        superseded_by_record = {"id": "elem-newer", "text": "newer action", "reason": "improvement", "detected": "manual"}
+        mock_result2 = MagicMock()
+
+        async def _aiter2():
+            yield superseded_by_record
+
+        mock_result2.__aiter__ = lambda self: _aiter2()
+
+        session.run = AsyncMock(side_effect=[mock_result1, mock_result2])
+
+        result = await client_with_driver.get_supersession_history("elem-current")
+
+        assert len(result["supersedes"]) == 1
+        assert result["supersedes"][0]["id"] == "elem-old"
+        assert result["superseded_by"] is not None
+        assert result["superseded_by"]["id"] == "elem-newer"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_superseded_by_when_no_incoming(self, client_with_driver):
+        """get_supersession_history should return None for superseded_by when no incoming edges."""
+        session = client_with_driver._mock_session
+
+        mock_result1 = MagicMock()
+
+        async def _aiter1():
+            return
+            yield
+
+        mock_result1.__aiter__ = lambda self: _aiter1()
+
+        mock_result2 = MagicMock()
+
+        async def _aiter2():
+            return
+            yield
+
+        mock_result2.__aiter__ = lambda self: _aiter2()
+
+        session.run = AsyncMock(side_effect=[mock_result1, mock_result2])
+
+        result = await client_with_driver.get_supersession_history("elem-leaf")
+
+        assert result["supersedes"] == []
+        assert result["superseded_by"] is None
