@@ -80,10 +80,12 @@ class RAGEngine:
         graph: Neo4jClient,
         vector: VectorClient,
         settings: Settings | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._graph = graph
         self._vector = vector
         self._settings = settings or get_settings()
+        self._http_client = http_client
 
     async def recall(self, query: ContextQuery) -> RecallResponse:
         """Retrieve, merge, score, and format memory context for an LLM.
@@ -458,24 +460,44 @@ class RAGEngine:
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        client = self._http_client or httpx.AsyncClient(timeout=15.0)
+        try:
             tasks = [
                 self._rerank_single(client, url, headers, model, task, c)
                 for c in candidates
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if not self._http_client:
+                await client.aclose()
 
         reranked: list[dict[str, Any]] = []
         for candidate, result in zip(candidates, results):
-            if isinstance(result, float):
+            if isinstance(result, Exception):
+                logger.warning("Re-rank failed for entry: %s", result)
+            elif result is not None:
                 candidate["score"] = result
-            else:
-                if isinstance(result, Exception):
-                    logger.warning("Re-rank failed for entry: %s", result)
-                # Keep original score on failure.
+            # else: unparseable response — keep original score
             reranked.append(candidate)
 
         return reranked
+
+    @staticmethod
+    def _parse_rerank_score(text: str) -> float | None:
+        """Extract a [0, 1] score from LLM rerank response text.
+
+        Returns None if no valid score can be parsed.
+        """
+        match = re.search(r"\b(0(?:\.\d+)?|1(?:\.0+)?)\b", text)
+        if match:
+            return float(match.group(1))
+        try:
+            value = float(text)
+            if 0.0 <= value <= 1.0:
+                return value
+        except (ValueError, TypeError):
+            pass
+        return None
 
     @staticmethod
     async def _rerank_single(
@@ -485,8 +507,11 @@ class RAGEngine:
         model: str,
         task: str,
         candidate: dict[str, Any],
-    ) -> float:
-        """Ask the LLM to score a single candidate's relevance to the task."""
+    ) -> float | None:
+        """Ask the LLM to score a single candidate's relevance to the task.
+
+        Returns None if the response cannot be parsed as a valid score.
+        """
         prompt = (
             "Rate the relevance of this memory to the task on a scale of 0-1. "
             "Respond with ONLY a decimal number between 0 and 1.\n\n"
@@ -506,11 +531,7 @@ class RAGEngine:
         response.raise_for_status()
         data = response.json()
         text = data["choices"][0]["message"]["content"].strip()
-        # Extract the first float-like value from the response.
-        match = re.search(r"([01](?:\.\d+)?)", text)
-        if match:
-            return float(match.group(1))
-        return float(text)
+        return RAGEngine._parse_rerank_score(text)
 
     # ------------------------------------------------------------------
     # Markdown formatting

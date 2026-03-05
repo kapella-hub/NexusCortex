@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -8,7 +9,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "NexusCortex"
     DEBUG: bool = False
     API_KEY: str | None = None
-    CORS_ORIGINS: list[str] = ["http://localhost:*"]
+    CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:8080"]
     RATE_LIMIT: str = "60/minute"
 
     # Neo4j
@@ -51,6 +52,27 @@ class Settings(BaseSettings):
 
     # Memory Decay
     MEMORY_DECAY_HALF_LIFE_DAYS: int = 90
+
+    # MCP Server
+    NEXUS_API_URL: str = "http://localhost:8000"
+    NEXUS_API_KEY: str | None = None
+    MCP_HOST: str = "0.0.0.0"
+    MCP_PORT: int = 8080
+
+    @field_validator("CONTENT_HASH_LENGTH")
+    @classmethod
+    def validate_hash_length(cls, v: int) -> int:
+        if v < 16:
+            raise ValueError("CONTENT_HASH_LENGTH must be >= 16 to avoid hash collisions")
+        return v
+
+    def model_post_init(self, __context):
+        import logging as _logging
+        _log = _logging.getLogger("app.config")
+        if not self.NEO4J_PASSWORD:
+            _log.warning("NEO4J_PASSWORD is empty — set via environment or .env")
+        if not self.LLM_API_KEY:
+            _log.warning("LLM_API_KEY is empty — set via environment or .env")
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
+import httpx
 import redis.asyncio
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -81,14 +82,23 @@ async def lifespan(app: FastAPI):
     app.state.graph_client = Neo4jClient(settings)
     app.state.vector_client = VectorClient(settings)
     app.state.redis_client = redis.asyncio.from_url(settings.REDIS_URL)
+    app.state.http_client = httpx.AsyncClient(timeout=15.0)
     app.state.start_time = datetime.now(timezone.utc)
 
     await app.state.graph_client.connect()
     await app.state.graph_client.ensure_indexes()
     await app.state.vector_client.initialize()
 
+    app.state.rag_engine = RAGEngine(
+        graph=app.state.graph_client,
+        vector=app.state.vector_client,
+        settings=settings,
+        http_client=app.state.http_client,
+    )
+
     yield
 
+    await app.state.http_client.aclose()
     await app.state.vector_client.close()
     await app.state.graph_client.close()
     await app.state.redis_client.aclose()
@@ -111,6 +121,10 @@ app.state.limiter = limiter
 # ---------------------------------------------------------------------------
 # Middleware
 # ---------------------------------------------------------------------------
+
+
+class _BodyTooLargeError(Exception):
+    """Internal sentinel raised when chunked request body exceeds the limit."""
 
 
 class RequestBodySizeLimitMiddleware:
@@ -147,10 +161,17 @@ class RequestBodySizeLimitMiddleware:
                     body = message.get("body", b"")
                     total_bytes += len(body)
                     if total_bytes > max_bytes:
-                        raise HTTPException(status_code=413, detail="Request body too large")
+                        raise _BodyTooLargeError()
                 return message
 
-            await self.app(scope, receive_with_limit, send)
+            try:
+                await self.app(scope, receive_with_limit, send)
+            except _BodyTooLargeError:
+                response = JSONResponse(
+                    status_code=413,
+                    content={"detail": "Request body too large"},
+                )
+                await response(scope, receive, send)
             return
         await self.app(scope, receive, send)
 
@@ -166,16 +187,16 @@ class APIKeyMiddleware:
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
+        self._api_key = get_settings().API_KEY
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http":
-            settings = get_settings()
-            if settings.API_KEY is not None:
+            if self._api_key is not None:
                 path = scope.get("path", "")
                 if path not in self.SKIP_PATHS:
                     headers = dict(scope.get("headers", []))
                     api_key = headers.get(b"x-api-key", b"").decode("utf-8", errors="replace")
-                    if not hmac.compare_digest(api_key, settings.API_KEY):
+                    if not hmac.compare_digest(api_key, self._api_key):
                         request_id = headers.get(b"x-request-id", b"").decode("utf-8", errors="replace") or None
                         error = ErrorDetail(
                             error_code="UNAUTHORIZED",
@@ -273,6 +294,10 @@ async def get_redis(request: Request) -> redis.asyncio.Redis:
     return request.app.state.redis_client
 
 
+async def get_rag_engine(request: Request) -> RAGEngine:
+    return request.app.state.rag_engine
+
+
 # ---------------------------------------------------------------------------
 # Exception Handlers
 # ---------------------------------------------------------------------------
@@ -368,8 +393,7 @@ async def health(
 
     # Neo4j
     try:
-        driver = graph._ensure_driver()
-        await driver.verify_connectivity()
+        await graph.ping()
         services["graph"] = ServiceStatus(status="connected")
     except Exception as exc:
         logger.warning("Neo4j health check failed: %s", exc)
@@ -377,7 +401,7 @@ async def health(
 
     # Qdrant
     try:
-        await vector._client.get_collections()
+        await vector.ping()
         services["qdrant"] = ServiceStatus(status="connected")
     except Exception as exc:
         logger.warning("Qdrant health check failed: %s", exc)
@@ -392,12 +416,7 @@ async def health(
         pass
 
     # Memory count from Qdrant
-    memory_count: int | None = None
-    try:
-        collection_info = await vector._client.get_collection(vector._collection)
-        memory_count = collection_info.points_count
-    except Exception:
-        pass
+    memory_count = await vector.memory_count()
 
     all_connected = all(s.status == "connected" for s in services.values())
     return HealthResponse(
@@ -414,11 +433,9 @@ async def health(
 async def memory_recall(
     request: Request,
     query: ContextQuery,
-    graph: Annotated[Neo4jClient, Depends(get_graph)],
-    vector: Annotated[VectorClient, Depends(get_vector)],
+    engine: Annotated[RAGEngine, Depends(get_rag_engine)],
 ) -> RecallResponse:
     """Dual-retrieval memory recall: graph + vector search, merged and scored."""
-    engine = RAGEngine(graph=graph, vector=vector)
     result = await engine.recall(query)
     result.request_id = _get_request_id(request)
     return result
@@ -437,7 +454,7 @@ async def memory_learn(
     if log.resolution:
         text += f" Resolution: {log.resolution}"
 
-    graph_id, vector_id = await asyncio.gather(
+    graph_result, vector_result = await asyncio.gather(
         graph.merge_action_log(log),
         vector.upsert(
             text=text,
@@ -447,9 +464,33 @@ async def memory_learn(
                 "domain": log.domain,
             },
         ),
+        return_exceptions=True,
     )
 
-    return LearnResponse(status="stored", graph_id=graph_id, vector_id=vector_id)
+    graph_failed = isinstance(graph_result, BaseException)
+    vector_failed = isinstance(vector_result, BaseException)
+
+    if graph_failed and vector_failed:
+        logger.error("Both stores failed: graph=%s, vector=%s", graph_result, vector_result)
+        raise GraphConnectionError(f"Both stores failed during learn: {graph_result}")
+
+    if graph_failed:
+        logger.error("Graph write failed (vector succeeded): %s", graph_result)
+        return LearnResponse(
+            status="partial",
+            graph_id=None,
+            vector_id=str(vector_result),
+        )
+
+    if vector_failed:
+        logger.error("Vector write failed (graph succeeded): %s", vector_result)
+        return LearnResponse(
+            status="partial",
+            graph_id=str(graph_result),
+            vector_id=None,
+        )
+
+    return LearnResponse(status="stored", graph_id=graph_result, vector_id=vector_result)
 
 
 @app.post("/memory/stream", response_model=StreamResponse)

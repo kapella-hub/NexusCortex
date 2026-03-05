@@ -23,15 +23,9 @@ from app.models import RecallResponse, MemorySource
 class TestHealthEndpoint:
     def test_health_returns_ok(self, test_client, mock_graph, mock_vector, mock_redis):
         """Health endpoint with all services connected returns 'ok'."""
-        # Mock the service probes used by the health endpoint
-        mock_driver = MagicMock()
-        mock_driver.verify_connectivity = AsyncMock()
-        mock_graph._ensure_driver = MagicMock(return_value=mock_driver)
-
-        mock_qdrant = AsyncMock()
-        mock_qdrant.get_collections = AsyncMock()
-        mock_vector._client = mock_qdrant
-
+        mock_graph.ping = AsyncMock()
+        mock_vector.ping = AsyncMock()
+        mock_vector.memory_count = AsyncMock(return_value=42)
         mock_redis.ping = AsyncMock()
 
         resp = test_client.get("/health")
@@ -45,14 +39,9 @@ class TestHealthEndpoint:
 
     def test_health_degraded_when_graph_down(self, test_client, mock_graph, mock_vector, mock_redis):
         """Health returns 'degraded' when Neo4j is unreachable."""
-        mock_driver = MagicMock()
-        mock_driver.verify_connectivity = AsyncMock(side_effect=RuntimeError("Neo4j down"))
-        mock_graph._ensure_driver = MagicMock(return_value=mock_driver)
-
-        mock_qdrant = AsyncMock()
-        mock_qdrant.get_collections = AsyncMock()
-        mock_vector._client = mock_qdrant
-
+        mock_graph.ping = AsyncMock(side_effect=RuntimeError("Neo4j down"))
+        mock_vector.ping = AsyncMock()
+        mock_vector.memory_count = AsyncMock(return_value=None)
         mock_redis.ping = AsyncMock()
 
         resp = test_client.get("/health")
@@ -65,14 +54,9 @@ class TestHealthEndpoint:
 
     def test_health_degraded_when_qdrant_down(self, test_client, mock_graph, mock_vector, mock_redis):
         """Health returns 'degraded' when Qdrant is unreachable."""
-        mock_driver = MagicMock()
-        mock_driver.verify_connectivity = AsyncMock()
-        mock_graph._ensure_driver = MagicMock(return_value=mock_driver)
-
-        mock_qdrant = AsyncMock()
-        mock_qdrant.get_collections = AsyncMock(side_effect=RuntimeError("Qdrant down"))
-        mock_vector._client = mock_qdrant
-
+        mock_graph.ping = AsyncMock()
+        mock_vector.ping = AsyncMock(side_effect=RuntimeError("Qdrant down"))
+        mock_vector.memory_count = AsyncMock(return_value=None)
         mock_redis.ping = AsyncMock()
 
         resp = test_client.get("/health")
@@ -83,14 +67,9 @@ class TestHealthEndpoint:
 
     def test_health_degraded_when_redis_down(self, test_client, mock_graph, mock_vector, mock_redis):
         """Health returns 'degraded' when Redis is unreachable."""
-        mock_driver = MagicMock()
-        mock_driver.verify_connectivity = AsyncMock()
-        mock_graph._ensure_driver = MagicMock(return_value=mock_driver)
-
-        mock_qdrant = AsyncMock()
-        mock_qdrant.get_collections = AsyncMock()
-        mock_vector._client = mock_qdrant
-
+        mock_graph.ping = AsyncMock()
+        mock_vector.ping = AsyncMock()
+        mock_vector.memory_count = AsyncMock(return_value=None)
         mock_redis.ping = AsyncMock(side_effect=RuntimeError("Redis down"))
 
         resp = test_client.get("/health")
@@ -101,14 +80,9 @@ class TestHealthEndpoint:
 
     def test_health_degraded_includes_error_detail(self, test_client, mock_graph, mock_vector, mock_redis):
         """Disconnected services include generic detail (no internal info leak)."""
-        mock_driver = MagicMock()
-        mock_driver.verify_connectivity = AsyncMock(side_effect=RuntimeError("connection refused"))
-        mock_graph._ensure_driver = MagicMock(return_value=mock_driver)
-
-        mock_qdrant = AsyncMock()
-        mock_qdrant.get_collections = AsyncMock()
-        mock_vector._client = mock_qdrant
-
+        mock_graph.ping = AsyncMock(side_effect=RuntimeError("connection refused"))
+        mock_vector.ping = AsyncMock()
+        mock_vector.memory_count = AsyncMock(return_value=None)
         mock_redis.ping = AsyncMock()
 
         resp = test_client.get("/health")
@@ -241,6 +215,50 @@ class TestMemoryLearn:
         resp = test_client.post("/memory/learn", json={"action": "only action"})
         assert resp.status_code == 422
 
+    def test_learn_graph_failure_returns_partial(
+        self, test_client, mock_graph, mock_vector
+    ):
+        mock_graph.merge_action_log.side_effect = RuntimeError("neo4j down")
+        mock_vector.upsert.return_value = "vector-id-1"
+
+        resp = test_client.post(
+            "/memory/learn",
+            json={"action": "test", "outcome": "test"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "partial"
+        assert body["graph_id"] is None
+        assert body["vector_id"] == "vector-id-1"
+
+    def test_learn_vector_failure_returns_partial(
+        self, test_client, mock_graph, mock_vector
+    ):
+        mock_graph.merge_action_log.return_value = "graph-id-1"
+        mock_vector.upsert.side_effect = RuntimeError("qdrant down")
+
+        resp = test_client.post(
+            "/memory/learn",
+            json={"action": "test", "outcome": "test"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "partial"
+        assert body["graph_id"] == "graph-id-1"
+        assert body["vector_id"] is None
+
+    def test_learn_both_fail_returns_503(
+        self, test_client, mock_graph, mock_vector
+    ):
+        mock_graph.merge_action_log.side_effect = RuntimeError("neo4j down")
+        mock_vector.upsert.side_effect = RuntimeError("qdrant down")
+
+        resp = test_client.post(
+            "/memory/learn",
+            json={"action": "test", "outcome": "test"},
+        )
+        assert resp.status_code == 503
+
 
 # ---------------------------------------------------------------------------
 # POST /memory/stream
@@ -333,7 +351,7 @@ class TestExceptionHandlers:
         assert len(body["sources"]) == 1
         assert body["sources"][0]["store"] == "vector"
 
-    def test_graph_error_on_learn_returns_503(
+    def test_graph_error_on_learn_returns_partial(
         self, test_client, mock_graph, mock_vector
     ):
         mock_graph.merge_action_log.side_effect = GraphConnectionError(
@@ -343,10 +361,12 @@ class TestExceptionHandlers:
             "/memory/learn",
             json={"action": "a", "outcome": "o"},
         )
-        assert resp.status_code == 503
-        assert resp.json()["detail"] == "Knowledge graph service unavailable"
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "partial"
+        assert body["graph_id"] is None
 
-    def test_vector_error_on_learn_returns_502(
+    def test_vector_error_on_learn_returns_partial(
         self, test_client, mock_graph, mock_vector
     ):
         mock_graph.merge_action_log.return_value = "id"
@@ -356,8 +376,10 @@ class TestExceptionHandlers:
             "/memory/learn",
             json={"action": "a", "outcome": "o"},
         )
-        assert resp.status_code == 502
-        assert resp.json()["detail"] == "Vector store service error"
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "partial"
+        assert body["vector_id"] is None
 
     def test_stream_ingestion_error_returns_502(
         self, test_client, mock_redis
@@ -368,3 +390,60 @@ class TestExceptionHandlers:
             json={"source": "s", "payload": {"k": "v"}},
         )
         assert resp.status_code == 502
+
+
+# ---------------------------------------------------------------------------
+# POST /memory/feedback
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryFeedback:
+    def test_feedback_success(self, test_client, mock_vector):
+        mock_vector._client = AsyncMock()
+        mock_vector._collection = "test_memory"
+        mock_vector._client.set_payload = AsyncMock()
+
+        resp = test_client.post(
+            "/memory/feedback",
+            json={"memory_ids": ["id-1", "id-2"], "useful": True, "comment": "helpful"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "recorded"
+        assert body["updated"] == 2
+
+    def test_feedback_partial_failure(self, test_client, mock_vector):
+        mock_vector._client = AsyncMock()
+        mock_vector._collection = "test_memory"
+        call_count = 0
+
+        async def set_payload_side_effect(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("Qdrant error")
+
+        mock_vector._client.set_payload = AsyncMock(side_effect=set_payload_side_effect)
+
+        resp = test_client.post(
+            "/memory/feedback",
+            json={"memory_ids": ["id-1", "id-2", "id-3"], "useful": False},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "recorded"
+        assert body["updated"] == 2  # 1 of 3 failed
+
+    def test_feedback_empty_ids_rejected(self, test_client):
+        resp = test_client.post(
+            "/memory/feedback",
+            json={"memory_ids": [], "useful": True},
+        )
+        assert resp.status_code == 422
+
+    def test_feedback_missing_useful_rejected(self, test_client):
+        resp = test_client.post(
+            "/memory/feedback",
+            json={"memory_ids": ["id-1"]},
+        )
+        assert resp.status_code == 422

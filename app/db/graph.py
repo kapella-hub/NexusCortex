@@ -109,6 +109,11 @@ class Neo4jClient:
             raise GraphConnectionError("Neo4j driver is not connected")
         return self._driver
 
+    async def ping(self) -> None:
+        """Verify connectivity to Neo4j. Raises on failure."""
+        driver = self._ensure_driver()
+        await driver.verify_connectivity()
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -531,10 +536,10 @@ class Neo4jClient:
                     query, search_terms=search_terms, limit=limit
                 )
                 return [dict(record) async for record in result]
-        except Exception:
-            # Fulltext index may not exist yet — fall back gracefully
+        except neo4j.exceptions.ClientError:
+            # Fulltext index may not exist — fall back gracefully
             logger.debug(
-                "Fulltext index query failed, falling back to CONTAINS search"
+                "Fulltext index not available, falling back to CONTAINS search"
             )
             return None
 
@@ -587,7 +592,7 @@ class Neo4jClient:
         """Find resolutions for outcomes matching the given error pattern."""
         query = """
         MATCH (o:Outcome)-[:RESOLVED_BY]->(r:Resolution)
-        WHERE o.description CONTAINS $error_pattern
+        WHERE toLower(o.description) CONTAINS toLower($error_pattern)
         RETURN r.description AS resolution,
                o.description AS error,
                elementId(r) AS id

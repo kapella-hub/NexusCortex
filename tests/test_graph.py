@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import neo4j
 import pytest
 
 from app.config import Settings
@@ -315,7 +316,14 @@ class TestQueryRelated:
     @pytest.mark.asyncio
     async def test_query_related_driver_error(self, client_with_driver):
         session = client_with_driver._mock_session
-        session.run = AsyncMock(side_effect=RuntimeError("timeout"))
+        # First call (fulltext) raises ClientError → triggers fallback.
+        # Second call (CONTAINS fallback) raises RuntimeError → wrapped as GraphConnectionError.
+        session.run = AsyncMock(
+            side_effect=[
+                neo4j.exceptions.ClientError("index not found"),
+                RuntimeError("timeout"),
+            ]
+        )
 
         with pytest.raises(GraphConnectionError, match="Failed to query related"):
             await client_with_driver.query_related("anything meaningful")

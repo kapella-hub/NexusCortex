@@ -10,7 +10,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.main import app, get_graph, get_redis, get_vector
+from app.engine.rag import RAGEngine
+from app.main import app, get_graph, get_rag_engine, get_redis, get_vector
 
 
 @pytest.fixture()
@@ -105,9 +106,15 @@ def test_client(mock_graph: AsyncMock, mock_vector: AsyncMock, mock_redis: Async
 
     app.router.lifespan_context = _noop_lifespan
 
+    rag_engine = RAGEngine(graph=mock_graph, vector=mock_vector)
+
+    async def _override_rag_engine():
+        return rag_engine
+
     app.dependency_overrides[get_graph] = _override_graph
     app.dependency_overrides[get_vector] = _override_vector
     app.dependency_overrides[get_redis] = _override_redis
+    app.dependency_overrides[get_rag_engine] = _override_rag_engine
 
     with TestClient(app, raise_server_exceptions=False) as client:
         yield client

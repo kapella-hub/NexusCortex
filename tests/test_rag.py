@@ -559,3 +559,47 @@ class TestRecall:
         # After min-max normalization: 0.8 -> 1.0, 0.6 -> 0.0
         # aggregate_score = max of source scores = 1.0
         assert response.score == 1.0
+
+
+# ---------------------------------------------------------------------------
+# _parse_rerank_score
+# ---------------------------------------------------------------------------
+
+
+class TestParseRerankScore:
+    def test_simple_decimal(self):
+        assert RAGEngine._parse_rerank_score("0.85") == 0.85
+
+    def test_zero(self):
+        assert RAGEngine._parse_rerank_score("0") == 0.0
+
+    def test_one(self):
+        assert RAGEngine._parse_rerank_score("1") == 1.0
+
+    def test_one_point_zero(self):
+        assert RAGEngine._parse_rerank_score("1.0") == 1.0
+
+    def test_zero_point_zero(self):
+        assert RAGEngine._parse_rerank_score("0.0") == 0.0
+
+    def test_with_surrounding_text(self):
+        assert RAGEngine._parse_rerank_score("The relevance score is 0.7") == 0.7
+
+    def test_does_not_match_numbers_above_one(self):
+        """Should not extract '1' from '10' or similar."""
+        result = RAGEngine._parse_rerank_score("10")
+        assert result is None
+
+    def test_garbage_text(self):
+        assert RAGEngine._parse_rerank_score("not a number at all") is None
+
+    def test_empty_string(self):
+        assert RAGEngine._parse_rerank_score("") is None
+
+    def test_fallback_to_float_parse(self):
+        """A plain float string in range should work via fallback."""
+        assert RAGEngine._parse_rerank_score("0.42") == 0.42
+
+    def test_out_of_range_rejected(self):
+        """No valid [0, 1] score can be extracted from '5.3'."""
+        assert RAGEngine._parse_rerank_score("5.3") is None

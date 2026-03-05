@@ -229,12 +229,11 @@ def _shutdown_client() -> None:
     if _client is not None and not _client.is_closed:
         try:
             loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(_client.aclose())
-            else:
+            if not loop.is_running():
                 loop.run_until_complete(_client.aclose())
+            # If loop is running during atexit, we can't safely close.
+            # The process is exiting — let the OS reclaim the socket.
         except RuntimeError:
-            # No event loop available; client will be GC'd
             pass
         _client = None
 

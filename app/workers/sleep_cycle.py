@@ -205,56 +205,59 @@ def _write_to_neo4j(
     count = 0
     driver = _get_neo4j_driver()
     with driver.session() as session:
-        # Merge nodes grouped by label
-        if nodes:
-            label_groups: dict[str, list[dict[str, Any]]] = {}
-            for node in nodes:
-                label = node.get("label", "Entity")
-                label_groups.setdefault(label, []).append(node)
+        with session.begin_transaction() as tx:
+            # Merge nodes grouped by label
+            if nodes:
+                label_groups: dict[str, list[dict[str, Any]]] = {}
+                for node in nodes:
+                    label = node.get("label", "Entity")
+                    label_groups.setdefault(label, []).append(node)
 
-            for label, group in label_groups.items():
-                safe_label = "".join(
-                    c for c in label if c.isalnum() or c == "_"
-                )
-                if not safe_label:
-                    safe_label = "Entity"
+                for label, group in label_groups.items():
+                    safe_label = "".join(
+                        c for c in label if c.isalnum() or c == "_"
+                    )
+                    if not safe_label:
+                        safe_label = "Entity"
 
-                query = (
-                    "UNWIND $nodes AS node "
-                    f"MERGE (n:{safe_label} {{id: node.id}}) "
-                    "SET n += node.properties "
-                    "RETURN count(n) AS cnt"
-                )
-                result = session.run(query, nodes=group)
-                record = result.single()
-                if record:
-                    count += record["cnt"]
+                    query = (
+                        "UNWIND $nodes AS node "
+                        f"MERGE (n:{safe_label} {{id: node.id}}) "
+                        "SET n += node.properties "
+                        "RETURN count(n) AS cnt"
+                    )
+                    result = tx.run(query, nodes=group)
+                    record = result.single()
+                    if record:
+                        count += record["cnt"]
 
-        # Merge edges grouped by relationship type
-        if edges:
-            rel_groups: dict[str, list[dict[str, Any]]] = {}
-            for edge in edges:
-                rel_type = edge.get("type", "RELATED_TO")
-                rel_groups.setdefault(rel_type, []).append(edge)
+            # Merge edges grouped by relationship type
+            if edges:
+                rel_groups: dict[str, list[dict[str, Any]]] = {}
+                for edge in edges:
+                    rel_type = edge.get("type", "RELATED_TO")
+                    rel_groups.setdefault(rel_type, []).append(edge)
 
-            for rel_type, group in rel_groups.items():
-                safe_type = "".join(
-                    c for c in rel_type if c.isalnum() or c == "_"
-                )
-                if not safe_type:
-                    safe_type = "RELATED_TO"
+                for rel_type, group in rel_groups.items():
+                    safe_type = "".join(
+                        c for c in rel_type if c.isalnum() or c == "_"
+                    )
+                    if not safe_type:
+                        safe_type = "RELATED_TO"
 
-                query = (
-                    "UNWIND $edges AS edge "
-                    "MATCH (src {id: edge.source}) "
-                    "MATCH (tgt {id: edge.target}) "
-                    f"MERGE (src)-[r:{safe_type}]->(tgt) "
-                    "RETURN count(r) AS cnt"
-                )
-                result = session.run(query, edges=group)
-                record = result.single()
-                if record:
-                    count += record["cnt"]
+                    query = (
+                        "UNWIND $edges AS edge "
+                        "MATCH (src {id: edge.source}) "
+                        "MATCH (tgt {id: edge.target}) "
+                        f"MERGE (src)-[r:{safe_type}]->(tgt) "
+                        "RETURN count(r) AS cnt"
+                    )
+                    result = tx.run(query, edges=group)
+                    record = result.single()
+                    if record:
+                        count += record["cnt"]
+
+            tx.commit()
 
     return count
 

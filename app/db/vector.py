@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timezone
 
 from typing import TYPE_CHECKING, Any
@@ -56,8 +57,7 @@ class VectorClient:
         self._client = AsyncQdrantClient(host=self._host, port=self._port)
         self._http_client = httpx.AsyncClient(timeout=30.0)
         # LRU embedding cache: hash(text) -> embedding vector
-        self._embed_cache: dict[str, list[float]] = {}
-        self._cache_order: list[str] = []
+        self._embed_cache: OrderedDict[str, list[float]] = OrderedDict()
 
     async def initialize(self) -> None:
         """Create the Qdrant collection if it doesn't already exist."""
@@ -102,6 +102,18 @@ class VectorClient:
         await self._http_client.aclose()
         await self._client.close()
         logger.info("Qdrant client closed")
+
+    async def ping(self) -> None:
+        """Verify connectivity to Qdrant. Raises on failure."""
+        await self._client.get_collections()
+
+    async def memory_count(self) -> int | None:
+        """Return the number of points in the collection, or None on failure."""
+        try:
+            info = await self._client.get_collection(self._collection)
+            return info.points_count
+        except Exception:
+            return None
 
     async def upsert(self, text: str, metadata: dict[str, Any]) -> str:
         """Embed text and upsert into Qdrant.
@@ -311,6 +323,7 @@ class VectorClient:
 
         # Check cache
         if cache_key in self._embed_cache:
+            self._embed_cache.move_to_end(cache_key)
             logger.debug("Embedding cache hit for text hash %s", cache_key[:12])
             return self._embed_cache[cache_key]
 
@@ -348,15 +361,8 @@ class VectorClient:
     def _cache_put(self, key: str, value: list[float]) -> None:
         """Insert into the embedding cache with LRU eviction."""
         if key in self._embed_cache:
-            # Move to end (most recently used)
-            self._cache_order.remove(key)
-            self._cache_order.append(key)
+            self._embed_cache.move_to_end(key)
             return
-
         if len(self._embed_cache) >= _EMBED_CACHE_MAX_SIZE:
-            # Evict oldest entry
-            evicted = self._cache_order.pop(0)
-            del self._embed_cache[evicted]
-
+            self._embed_cache.popitem(last=False)
         self._embed_cache[key] = value
-        self._cache_order.append(key)
