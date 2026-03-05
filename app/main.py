@@ -536,16 +536,14 @@ async def memory_feedback(
     with the feedback signal (useful/not useful) and optional comment.
     """
     updated = 0
+    timestamp = datetime.now(timezone.utc).isoformat()
     for memory_id in feedback.memory_ids:
         try:
-            await vector._client.set_payload(
-                collection_name=vector._collection,
-                payload={
-                    "feedback_useful": feedback.useful,
-                    "feedback_comment": feedback.comment,
-                    "feedback_timestamp": datetime.now(timezone.utc).isoformat(),
-                },
-                points=[memory_id],
+            await vector.set_feedback(
+                memory_id=memory_id,
+                useful=feedback.useful,
+                comment=feedback.comment,
+                timestamp=timestamp,
             )
             updated += 1
         except Exception:

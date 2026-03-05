@@ -119,6 +119,7 @@ def _get_neo4j_driver():
         _neo4j_driver = GraphDatabase.driver(
             s.NEO4J_URI,
             auth=(s.NEO4J_USER, s.NEO4J_PASSWORD),
+            max_connection_pool_size=s.NEO4J_POOL_SIZE,
         )
         atexit.register(_close_neo4j_driver)
     return _neo4j_driver
@@ -393,6 +394,8 @@ def _send_to_dlq(
     try:
         for item in items:
             redis_client.lpush(dlq_key, item)
+        # Cap DLQ size
+        redis_client.ltrim(dlq_key, 0, settings.DLQ_MAX_SIZE - 1)
         logger.info("Sent %d items to DLQ (%s)", len(items), dlq_key)
     except Exception:
         logger.exception("Failed to send items to DLQ")

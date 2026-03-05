@@ -170,10 +170,10 @@ class Neo4jClient:
 
         # Build bigrams from consecutive non-stopword tokens
         bigrams: list[str] = []
-        non_stop = [
+        non_stop = list(dict.fromkeys(
             t for t in tokens
             if len(t) >= 3 and t not in _STOPWORDS and t not in _DOMAIN_STOPWORDS
-        ]
+        ))
         for i in range(len(non_stop) - 1):
             bigram = f"{non_stop[i]} {non_stop[i + 1]}"
             if bigram not in seen:
@@ -264,6 +264,8 @@ class Neo4jClient:
         All writes are wrapped in a single explicit transaction so that
         a failure partway through does not leave partial data.
         """
+        domain = self._canonicalize(log.domain)
+        tags = [self._canonicalize(t) for t in log.tags]
         action_id = self._content_hash(log.action)
         outcome_id = self._content_hash(log.outcome)
 
@@ -300,14 +302,14 @@ class Neo4jClient:
                 try:
                     result = await tx.run(
                         query,
-                        domain=log.domain,
+                        domain=domain,
                         action=log.action,
                         action_id=action_id,
                         outcome=log.outcome,
                         outcome_id=outcome_id,
                         resolution=log.resolution,
                         resolution_id=resolution_id,
-                        tags=log.tags,
+                        tags=tags,
                     )
                     record = await result.single()
                     if record is None:
@@ -513,7 +515,14 @@ class Neo4jClient:
             special = r'+-&|!(){}[]^"~*?:\/'
             return "".join(f"\\{c}" if c in special else c for c in term)
 
-        search_terms = " OR ".join(_escape_lucene(kw) for kw in keywords)
+        parts = []
+        for kw in keywords:
+            escaped = _escape_lucene(kw)
+            if " " in kw:
+                parts.append(f'"{escaped}"')
+            else:
+                parts.append(escaped)
+        search_terms = " OR ".join(parts)
 
         query = """
         CALL db.index.fulltext.queryNodes('node_fulltext', $search_terms)

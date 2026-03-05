@@ -9,6 +9,7 @@ import pytest
 
 from app.workers.sleep_cycle import (
     CONSOLIDATION_SYSTEM_PROMPT,
+    _get_neo4j_driver,
     _process_batch,
     _send_to_dlq,
     _validate_edges,
@@ -402,3 +403,57 @@ class TestProcessEventBatch:
             mock_batch.side_effect = RuntimeError("unexpected")
             result = process_event_batch()
             assert result["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# _get_neo4j_driver — pool size config
+# ---------------------------------------------------------------------------
+
+
+class TestGetNeo4jDriver:
+    def test_passes_pool_size_config(self):
+        """_get_neo4j_driver should pass NEO4J_POOL_SIZE to the driver."""
+        import app.workers.sleep_cycle as mod
+
+        # Reset cached driver so it gets recreated
+        mod._neo4j_driver = None
+
+        mock_settings = MagicMock()
+        mock_settings.NEO4J_URI = "bolt://localhost:7687"
+        mock_settings.NEO4J_USER = "neo4j"
+        mock_settings.NEO4J_PASSWORD = "test"
+        mock_settings.NEO4J_POOL_SIZE = 42
+
+        with patch("app.workers.sleep_cycle.get_settings", return_value=mock_settings), \
+             patch("app.workers.sleep_cycle.GraphDatabase.driver") as mock_driver_cls:
+            mock_driver_cls.return_value = MagicMock()
+            driver = _get_neo4j_driver()
+
+            mock_driver_cls.assert_called_once_with(
+                "bolt://localhost:7687",
+                auth=("neo4j", "test"),
+                max_connection_pool_size=42,
+            )
+
+        # Clean up cached driver to avoid side effects
+        mod._neo4j_driver = None
+
+
+# ---------------------------------------------------------------------------
+# _send_to_dlq — ltrim cap
+# ---------------------------------------------------------------------------
+
+
+class TestSendToDlqCap:
+    def test_ltrim_called_to_cap_dlq_size(self):
+        """_send_to_dlq should call ltrim to cap the DLQ at DLQ_MAX_SIZE."""
+        mock_redis = MagicMock()
+        mock_settings = MagicMock()
+        mock_settings.REDIS_STREAM_KEY = "nexus:event_stream"
+        mock_settings.DLQ_MAX_SIZE = 500
+
+        items = ['{"event": 1}', '{"event": 2}']
+        _send_to_dlq(mock_redis, items, mock_settings)
+
+        expected_dlq_key = "nexus:event_stream:dlq"
+        mock_redis.ltrim.assert_called_once_with(expected_dlq_key, 0, 499)

@@ -21,18 +21,20 @@ MCP_PORT = int(os.getenv("MCP_PORT", "8080"))
 mcp = FastMCP("NexusCortex")
 
 _client: httpx.AsyncClient | None = None
+_client_lock = asyncio.Lock()
 
 
 async def _get_client() -> httpx.AsyncClient:
     """Return a shared httpx client, lazily initialized."""
     global _client
-    if _client is None or _client.is_closed:
-        headers: dict[str, str] = {}
-        if NEXUS_API_KEY:
-            headers["X-API-Key"] = NEXUS_API_KEY
-        _client = httpx.AsyncClient(
-            base_url=NEXUS_API_URL, timeout=30.0, headers=headers
-        )
+    async with _client_lock:
+        if _client is None or _client.is_closed:
+            headers: dict[str, str] = {}
+            if NEXUS_API_KEY:
+                headers["X-API-Key"] = NEXUS_API_KEY
+            _client = httpx.AsyncClient(
+                base_url=NEXUS_API_URL, timeout=30.0, headers=headers
+            )
     return _client
 
 

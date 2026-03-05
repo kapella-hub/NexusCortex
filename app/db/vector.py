@@ -251,6 +251,7 @@ class VectorClient:
 
         for i, key in enumerate(cache_keys):
             if key in self._embed_cache:
+                self._embed_cache.move_to_end(key)
                 results[i] = self._embed_cache[key]
                 logger.debug("batch_embed cache hit for index %d", i)
             else:
@@ -357,6 +358,31 @@ class VectorClient:
         self._cache_put(cache_key, embedding)
 
         return embedding
+
+    async def set_feedback(
+        self,
+        memory_id: str,
+        useful: bool,
+        comment: str | None,
+        timestamp: str,
+    ) -> None:
+        """Update a memory point's payload with feedback metadata.
+
+        Args:
+            memory_id: The Qdrant point ID to update.
+            useful: Whether the memory was useful.
+            comment: Optional feedback comment.
+            timestamp: ISO-format timestamp of the feedback.
+        """
+        await self._client.set_payload(
+            collection_name=self._collection,
+            payload={
+                "feedback_useful": useful,
+                "feedback_comment": comment,
+                "feedback_timestamp": timestamp,
+            },
+            points=[memory_id],
+        )
 
     def _cache_put(self, key: str, value: list[float]) -> None:
         """Insert into the embedding cache with LRU eviction."""

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
+from collections import OrderedDict
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.config import Settings
-from app.db.vector import NEXUS_UUID_NAMESPACE, VectorClient
+from app.db.vector import NEXUS_UUID_NAMESPACE, VectorClient, _EMBED_CACHE_MAX_SIZE
 from app.exceptions import VectorStoreError
 
 
@@ -366,3 +368,148 @@ class TestEmbed:
         call_args = mock_http_client.post.call_args
         headers = call_args.kwargs.get("headers", {})
         assert "Authorization" not in headers
+
+
+# ---------------------------------------------------------------------------
+# batch_embed LRU cache behaviour
+# ---------------------------------------------------------------------------
+
+
+class TestBatchEmbedLRU:
+    @pytest.mark.asyncio
+    async def test_batch_embed_promotes_cache_hits(self, vector_client):
+        """batch_embed should call move_to_end on cache hits to maintain LRU order."""
+        # Pre-populate cache with two entries; "aaa" is oldest (first inserted)
+        key_a = hashlib.sha256(b"aaa").hexdigest()
+        key_b = hashlib.sha256(b"bbb").hexdigest()
+        vector_client._embed_cache[key_a] = [0.1, 0.2]
+        vector_client._embed_cache[key_b] = [0.3, 0.4]
+
+        # Before batch_embed, "aaa" is the oldest (first to be evicted)
+        assert list(vector_client._embed_cache.keys())[0] == key_a
+
+        with patch.object(
+            vector_client, "_batch_embed_api", new_callable=AsyncMock
+        ) as mock_api:
+            # Request "aaa" via batch_embed — it should be promoted (moved to end)
+            result = await vector_client.batch_embed(["aaa"])
+
+        assert result == [[0.1, 0.2]]
+        mock_api.assert_not_called()  # everything came from cache
+
+        # After promotion, "aaa" should now be the newest (last), "bbb" oldest (first)
+        keys = list(vector_client._embed_cache.keys())
+        assert keys[0] == key_b
+        assert keys[-1] == key_a
+
+    @pytest.mark.asyncio
+    async def test_lru_eviction_when_cache_full(self, vector_client):
+        """When the cache is full, the least-recently-used entry should be evicted."""
+        # Fill cache to max capacity
+        for i in range(_EMBED_CACHE_MAX_SIZE):
+            key = hashlib.sha256(f"item-{i}".encode()).hexdigest()
+            vector_client._embed_cache[key] = [float(i)]
+
+        assert len(vector_client._embed_cache) == _EMBED_CACHE_MAX_SIZE
+        oldest_key = list(vector_client._embed_cache.keys())[0]  # "item-0"
+
+        # Insert one more via _cache_put — should evict the oldest
+        new_key = hashlib.sha256(b"new-item").hexdigest()
+        vector_client._cache_put(new_key, [99.0])
+
+        assert len(vector_client._embed_cache) == _EMBED_CACHE_MAX_SIZE
+        assert oldest_key not in vector_client._embed_cache
+        assert new_key in vector_client._embed_cache
+
+    @pytest.mark.asyncio
+    async def test_batch_embed_cache_hit_prevents_eviction(self, vector_client):
+        """Accessing an item via batch_embed should protect it from LRU eviction."""
+        # Fill cache to max - 1
+        for i in range(_EMBED_CACHE_MAX_SIZE - 1):
+            key = hashlib.sha256(f"fill-{i}".encode()).hexdigest()
+            vector_client._embed_cache[key] = [float(i)]
+
+        # Add a target entry as the oldest
+        target_key = hashlib.sha256(b"target").hexdigest()
+        # Insert at the beginning by rebuilding — target is oldest
+        old_cache = vector_client._embed_cache
+        vector_client._embed_cache = OrderedDict()
+        vector_client._embed_cache[target_key] = [1.0, 2.0]
+        vector_client._embed_cache.update(old_cache)
+
+        assert len(vector_client._embed_cache) == _EMBED_CACHE_MAX_SIZE
+        assert list(vector_client._embed_cache.keys())[0] == target_key
+
+        # Access "target" via batch_embed — promotes it to end
+        with patch.object(vector_client, "_batch_embed_api", new_callable=AsyncMock):
+            await vector_client.batch_embed(["target"])
+
+        # Now target should be last (newest), not first
+        assert list(vector_client._embed_cache.keys())[-1] == target_key
+
+        # Insert a new item — should evict the current oldest, NOT target
+        new_key = hashlib.sha256(b"newcomer").hexdigest()
+        vector_client._cache_put(new_key, [42.0])
+
+        assert target_key in vector_client._embed_cache
+        assert new_key in vector_client._embed_cache
+
+
+# ---------------------------------------------------------------------------
+# set_feedback
+# ---------------------------------------------------------------------------
+
+
+class TestSetFeedback:
+    @pytest.mark.asyncio
+    async def test_set_feedback_calls_qdrant(self, vector_client, mock_qdrant_client):
+        """set_feedback should call set_payload on the Qdrant client."""
+        mock_qdrant_client.set_payload = AsyncMock()
+
+        await vector_client.set_feedback(
+            memory_id="point-123",
+            useful=True,
+            comment="Very helpful",
+            timestamp="2026-03-05T12:00:00+00:00",
+        )
+
+        mock_qdrant_client.set_payload.assert_called_once_with(
+            collection_name="test_collection",
+            payload={
+                "feedback_useful": True,
+                "feedback_comment": "Very helpful",
+                "feedback_timestamp": "2026-03-05T12:00:00+00:00",
+            },
+            points=["point-123"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_set_feedback_with_no_comment(self, vector_client, mock_qdrant_client):
+        """set_feedback with comment=None should store None in payload."""
+        mock_qdrant_client.set_payload = AsyncMock()
+
+        await vector_client.set_feedback(
+            memory_id="point-456",
+            useful=False,
+            comment=None,
+            timestamp="2026-03-05T12:00:00+00:00",
+        )
+
+        call_kwargs = mock_qdrant_client.set_payload.call_args.kwargs
+        assert call_kwargs["payload"]["feedback_useful"] is False
+        assert call_kwargs["payload"]["feedback_comment"] is None
+
+    @pytest.mark.asyncio
+    async def test_set_feedback_propagates_errors(self, vector_client, mock_qdrant_client):
+        """Errors from Qdrant should propagate to the caller."""
+        mock_qdrant_client.set_payload = AsyncMock(
+            side_effect=RuntimeError("Qdrant unavailable")
+        )
+
+        with pytest.raises(RuntimeError, match="Qdrant unavailable"):
+            await vector_client.set_feedback(
+                memory_id="point-789",
+                useful=True,
+                comment=None,
+                timestamp="2026-03-05T12:00:00+00:00",
+            )

@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     REDIS_STREAM_KEY: str = "nexus:event_stream"
     REDIS_BATCH_SIZE: int = 50
+    DLQ_MAX_SIZE: int = 10_000
 
     # Celery
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"

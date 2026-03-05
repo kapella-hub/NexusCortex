@@ -399,9 +399,7 @@ class TestExceptionHandlers:
 
 class TestMemoryFeedback:
     def test_feedback_success(self, test_client, mock_vector):
-        mock_vector._client = AsyncMock()
-        mock_vector._collection = "test_memory"
-        mock_vector._client.set_payload = AsyncMock()
+        mock_vector.set_feedback = AsyncMock()
 
         resp = test_client.post(
             "/memory/feedback",
@@ -411,19 +409,18 @@ class TestMemoryFeedback:
         body = resp.json()
         assert body["status"] == "recorded"
         assert body["updated"] == 2
+        assert mock_vector.set_feedback.call_count == 2
 
     def test_feedback_partial_failure(self, test_client, mock_vector):
-        mock_vector._client = AsyncMock()
-        mock_vector._collection = "test_memory"
         call_count = 0
 
-        async def set_payload_side_effect(**kwargs):
+        async def set_feedback_side_effect(**kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 2:
                 raise RuntimeError("Qdrant error")
 
-        mock_vector._client.set_payload = AsyncMock(side_effect=set_payload_side_effect)
+        mock_vector.set_feedback = AsyncMock(side_effect=set_feedback_side_effect)
 
         resp = test_client.post(
             "/memory/feedback",

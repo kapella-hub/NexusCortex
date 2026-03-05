@@ -135,6 +135,16 @@ class TestExtractKeywords:
     def test_only_stopwords(self):
         assert Neo4jClient._extract_keywords("the is are was") == []
 
+    def test_deduplicates_tokens_for_bigrams(self):
+        """Repeated tokens should not produce duplicate bigrams like 'auth auth'."""
+        kws = Neo4jClient._extract_keywords("auth auth timeout auth")
+        for kw in kws:
+            if " " in kw:
+                parts = kw.split()
+                assert parts[0] != parts[1], f"Duplicate bigram found: {kw}"
+        # Should contain "auth timeout" bigram but not "auth auth"
+        assert "auth auth" not in kws
+
 
 # ---------------------------------------------------------------------------
 # merge_action_log
@@ -198,6 +208,26 @@ class TestMergeActionLog:
         log = ActionLog(action="a", outcome="o")
         with pytest.raises(GraphConnectionError, match="returned no result"):
             await client_with_driver.merge_action_log(log)
+
+    @pytest.mark.asyncio
+    async def test_merge_action_log_canonicalizes_domain_and_tags(self, client_with_driver):
+        """Domain and tags should be canonicalized (lowercased etc.) before Cypher params."""
+        tx = client_with_driver._mock_tx
+        mock_result = AsyncMock()
+        mock_result.single = AsyncMock(return_value={"id": "elem-id-789"})
+        tx.run = AsyncMock(return_value=mock_result)
+
+        log = ActionLog(
+            action="Deploy service",
+            outcome="Success",
+            tags=["Infra", "DB-Pool", "  Auth "],
+            domain="  Infra ",
+        )
+        await client_with_driver.merge_action_log(log)
+
+        call_kwargs = tx.run.call_args.kwargs
+        assert call_kwargs["domain"] == "infra"
+        assert call_kwargs["tags"] == ["infra", "db_pool", "auth"]
 
     @pytest.mark.asyncio
     async def test_merge_action_log_driver_error(self, client_with_driver):
@@ -354,6 +384,33 @@ class TestQueryRelated:
         # Should have search_terms parameter
         call_kwargs = call_args.kwargs
         assert "search_terms" in call_kwargs
+
+
+    @pytest.mark.asyncio
+    async def test_fulltext_query_wraps_bigrams_in_quotes(self, client_with_driver):
+        """Bigrams (terms with spaces) should be wrapped in double quotes for Lucene."""
+        session = client_with_driver._mock_session
+
+        mock_result = MagicMock()
+
+        async def _aiter():
+            return
+            yield  # empty async generator
+
+        mock_result.__aiter__ = lambda self: _aiter()
+        session.run = AsyncMock(return_value=mock_result)
+
+        await client_with_driver.query_related("authentication timeout problem", limit=5)
+
+        call_kwargs = session.run.call_args.kwargs
+        search_terms = call_kwargs["search_terms"]
+        # Any bigram (term with space) should be wrapped in quotes
+        for part in search_terms.split(" OR "):
+            part = part.strip()
+            if " " in part.strip('"'):
+                assert part.startswith('"') and part.endswith('"'), (
+                    f"Bigram not quoted: {part}"
+                )
 
 
 # ---------------------------------------------------------------------------
