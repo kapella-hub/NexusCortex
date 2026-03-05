@@ -148,7 +148,7 @@ class HealthResponse(BaseModel):
 
     status: str
     services: dict[str, ServiceStatus]
-    version: str = "0.4.0"
+    version: str = "0.5.0"
     uptime_seconds: float | None = None
     memory_count: int | None = None
 

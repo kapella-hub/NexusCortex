@@ -76,9 +76,10 @@ pytest tests/test_rag.py -v          # single test file
 pytest tests/test_models.py -k "test_context_query" -v  # single test
 ```
 
-### Run Celery worker
+### Run Celery worker + beat (separate processes)
 ```bash
-celery -A app.workers.sleep_cycle worker --beat --loglevel=info
+celery -A app.workers.sleep_cycle worker --loglevel=info
+celery -A app.workers.sleep_cycle beat --loglevel=info
 ```
 
 ### Run MCP server standalone
@@ -103,17 +104,25 @@ All configuration via environment variables or `.env` file. See `.env.example` f
 - **No APOC dependency**: Neo4j Cypher uses standard MERGE with dynamic labels grouped by type and sanitized against injection
 - **Dual-store scoring**: Items found in both Qdrant and Neo4j get a configurable boost (default 1.5x) via substring + Jaccard similarity matching (threshold 0.3)
 - **Score normalization**: Min-max normalization per source to [0,1] before merging, with composite graph scoring (text relevance + distance)
-- **Graceful degradation**: If one store fails during recall, the other still contributes results
+- **Graceful degradation**: If one store fails during recall, the other still contributes results; `/learn` returns partial success when one store fails
 - **Sleep Cycle DLQ**: Failed batches go to `nexus:event_stream:dlq` Redis key for later reprocessing
+- **Sleep Cycle transactions**: All Neo4j writes in the Sleep Cycle worker are wrapped in explicit transactions
 - **Cypher injection prevention**: Dynamic labels/relationship types are sanitized to alphanumeric + underscore only
-- **Fulltext index search**: Neo4j Lucene-backed fulltext index for relevance-scored graph queries (falls back to CONTAINS)
-- **API key authentication**: Optional X-API-Key middleware (skips /health, /docs)
+- **Fulltext index search**: Neo4j Lucene-backed fulltext index for relevance-scored graph queries (falls back to CONTAINS on `ClientError` only)
+- **Case-insensitive resolution queries**: `query_resolutions` uses `toLower()` on both sides for reliable matching
+- **API key authentication**: Optional X-API-Key middleware (skips /health, /docs), settings cached at init
 - **Rate limiting**: slowapi-based rate limiting (configurable, default 60/min)
 - **Memory decay**: Exponential decay based on entry age (configurable half-life, default 90 days)
-- **LLM re-ranking**: Optional re-ranking pass via LLM (gated behind RERANK_ENABLED config)
-- **Embedding cache**: LRU cache (512 entries) for vector embeddings
+- **LLM re-ranking**: Optional re-ranking pass via LLM (gated behind RERANK_ENABLED config), shared httpx client, robust score parsing with word-boundary regex
+- **Embedding cache**: OrderedDict-based LRU cache (512 entries) with O(1) eviction for vector embeddings
 - **Entity canonicalization**: Lowercase + normalize names before MERGE to reduce duplicates
 - **Redis pipeline batching**: Pipeline pattern for both event ingest and Sleep Cycle rpop
+- **Singleton RAGEngine**: Created once in lifespan with shared httpx client, injected via FastAPI DI
+- **Request body limit**: Content-Length pre-check + chunked-encoding guard with proper 413 responses
+- **Config validation**: CONTENT_HASH_LENGTH >= 16 enforced, startup warnings for empty secrets
+- **Port security**: All service ports (Neo4j, Qdrant, Redis, MCP) bound to 127.0.0.1 in docker-compose
+- **Celery beat separation**: Worker and beat run as independent Docker services to prevent task storms
+- **Public health methods**: `ping()` and `memory_count()` on clients — health endpoint uses public API only
 
 ## Development Practices
 
@@ -126,3 +135,4 @@ All configuration via environment variables or `.env` file. See `.env.example` f
 
 - `docs/ARCHITECTURE.md` — Full architecture specification with module contracts
 - `docs/SECURITY_REVIEW.md` — Security review findings and fixes
+- `docs/plans/2026-03-05-major-improvements.md` — v0.5.0 implementation plan (15 fixes)

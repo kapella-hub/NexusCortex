@@ -111,7 +111,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="NexusCortex",
     description="Memory-as-a-Service for LLM agents",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -422,7 +422,7 @@ async def health(
     return HealthResponse(
         status="ok" if all_connected else "degraded",
         services=services,
-        version="0.4.0",
+        version="0.5.0",
         uptime_seconds=uptime_seconds,
         memory_count=memory_count,
     )
