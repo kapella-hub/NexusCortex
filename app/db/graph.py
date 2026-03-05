@@ -296,7 +296,8 @@ class Neo4jClient:
         driver = self._ensure_driver()
         try:
             async with driver.session() as session:
-                async with session.begin_transaction() as tx:
+                tx = await session.begin_transaction()
+                try:
                     result = await tx.run(
                         query,
                         domain=log.domain,
@@ -315,6 +316,9 @@ class Neo4jClient:
                         )
                     action_element_id = record["id"]
                     await tx.commit()
+                except BaseException:
+                    await tx.rollback()
+                    raise
                 return action_element_id
         except GraphConnectionError:
             raise
@@ -349,7 +353,8 @@ class Neo4jClient:
 
         try:
             async with driver.session() as session:
-                async with session.begin_transaction() as tx:
+                tx = await session.begin_transaction()
+                try:
                     # --- Merge nodes with dynamic labels ---
                     if nodes:
                         label_groups: dict[str, list[dict[str, Any]]] = {}
@@ -454,6 +459,9 @@ class Neo4jClient:
                                     count += record["cnt"]
 
                     await tx.commit()
+                except BaseException:
+                    await tx.rollback()
+                    raise
 
         except GraphConnectionError:
             raise

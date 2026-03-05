@@ -42,16 +42,13 @@ def client_with_driver(settings: Settings) -> Neo4jClient:
     mock_tx = AsyncMock()
     mock_tx.run = AsyncMock()
     mock_tx.commit = AsyncMock()
-
-    # begin_transaction() returns an async CM whose __aenter__ yields the tx
-    mock_tx_ctx = AsyncMock()
-    mock_tx_ctx.__aenter__ = AsyncMock(return_value=mock_tx)
-    mock_tx_ctx.__aexit__ = AsyncMock(return_value=False)
+    mock_tx.rollback = AsyncMock()
 
     # --- Session mock ---
+    # begin_transaction() is a coroutine that returns the tx directly
     mock_session = AsyncMock()
     mock_session.run = AsyncMock()
-    mock_session.begin_transaction = MagicMock(return_value=mock_tx_ctx)
+    mock_session.begin_transaction = AsyncMock(return_value=mock_tx)
 
     # Build async context manager for driver.session()
     mock_sess_ctx = AsyncMock()
