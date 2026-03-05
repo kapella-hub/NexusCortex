@@ -23,23 +23,41 @@ app/
 ├── config.py          # Pydantic BaseSettings, env var loading
 ├── models.py          # Request/response Pydantic models
 ├── exceptions.py      # NexusCortexError hierarchy
-├── main.py            # FastAPI app, lifespan, routes, DI
+├── main.py            # FastAPI app, lifespan, routes, DI, router integration
 ├── mcp_server.py      # MCP server (Streamable HTTP, 4 tools)
+├── dashboard.py       # Web dashboard router (memory browser, graph viz, DLQ)
+├── webhooks.py        # Webhook registration and event firing
+├── stats.py           # Memory statistics endpoint
+├── transfer.py        # Export/import API (JSONL streaming)
+├── streaming.py       # SSE streaming recall endpoint
+├── embedding_admin.py # Embedding model admin (status, re-embed)
+├── static/
+│   └── dashboard.html # Self-contained dashboard SPA (zero dependencies)
 ├── db/
 │   ├── graph.py       # Neo4j async client, Cypher queries
 │   └── vector.py      # Qdrant async client, embedding + search
 ├── engine/
 │   └── rag.py         # Dual-retrieval RAG engine (vector + graph merge)
 └── workers/
-    └── sleep_cycle.py # Celery worker: Redis → LLM extraction → Neo4j
+    ├── sleep_cycle.py # Celery worker: Redis → LLM extraction → Neo4j
+    ├── gc.py          # Celery task: memory expiry & garbage collection
+    └── reembed.py     # Celery task: re-embed all vectors with new model
 ```
 
 ### API Endpoints
 - `POST /memory/recall` — Dual-retrieval RAG query, returns Markdown for LLM injection
+- `POST /memory/recall/stream` — SSE streaming recall (progressive results)
 - `POST /memory/learn` — Logs actions/outcomes/resolutions to both graph + vector (parallel writes)
 - `POST /memory/stream` — High-volume event ingest → Redis queue (pipeline batching)
 - `POST /memory/feedback` — Submit feedback on memory usefulness
+- `GET /memory/stats` — Memory statistics (counts, domains, tags, DLQ depth)
+- `GET /memory/export` — Export all memories as JSONL stream
+- `POST /memory/import` — Bulk import memories from JSONL
 - `GET /health` — Service connectivity status with version, uptime, memory count
+- `GET /dashboard/` — Web dashboard (memory browser, graph visualization, DLQ manager)
+- `POST /webhooks/` — Register webhook callbacks for memory events
+- `GET /admin/embeddings/status` — Embedding model info and cache stats
+- `POST /admin/embeddings/reembed` — Trigger re-embedding with progress tracking
 
 ### MCP Server (port 8080)
 Exposes 4 MCP tools via Streamable HTTP (`/mcp` endpoint):
@@ -54,8 +72,8 @@ Exposes 4 MCP tools via Streamable HTTP (`/mcp` endpoint):
 - `/stream` → LPUSH to Redis → Celery Beat (60s) → LLM extraction → Neo4j MERGE
 
 ### Graph Schema
-- **Nodes**: Domain, Concept, Action, Outcome, Resolution, EventStream
-- **Edges**: RELATES_TO, CAUSED, RESOLVED_BY, UTILIZES
+- **Nodes**: Namespace, Domain, Concept, Action, Outcome, Resolution, EventStream
+- **Edges**: CONTAINS, RELATES_TO, CAUSED, RESOLVED_BY, UTILIZES
 
 ## Commands
 
@@ -98,6 +116,8 @@ All configuration via environment variables or `.env` file. See `.env.example` f
 - `BOOST_FACTOR`, `GRAPH_RELEVANCE_WEIGHT`, `CONTENT_HASH_LENGTH` (RAG tuning)
 - `RERANK_ENABLED`, `RERANK_CANDIDATES_MULTIPLIER`, `MEMORY_DECAY_HALF_LIFE_DAYS` (advanced)
 - `NEXUS_API_URL`, `MCP_HOST`, `MCP_PORT`, `NEXUS_API_KEY` (MCP server)
+- `DEFAULT_NAMESPACE`, `MAX_MEMORY_AGE_DAYS`, `GC_SCHEDULE_HOURS` (multi-tenant & GC)
+- `DLQ_MAX_SIZE`, `REEMBED_BATCH_SIZE`, `PRUNE_SCORE_THRESHOLD` (operations)
 
 ## Key Design Decisions
 
@@ -120,9 +140,20 @@ All configuration via environment variables or `.env` file. See `.env.example` f
 - **Singleton RAGEngine**: Created once in lifespan with shared httpx client, injected via FastAPI DI
 - **Request body limit**: Content-Length pre-check + chunked-encoding guard with proper 413 responses
 - **Config validation**: CONTENT_HASH_LENGTH >= 16 enforced, startup warnings for empty secrets
-- **Port security**: All service ports (Neo4j, Qdrant, Redis, MCP) bound to 127.0.0.1 in docker-compose
+- **Port security**: Backend ports (Neo4j, Qdrant, Redis) bound to 127.0.0.1; API/MCP on 0.0.0.0
 - **Celery beat separation**: Worker and beat run as independent Docker services to prevent task storms
 - **Public health methods**: `ping()` and `memory_count()` on clients — health endpoint uses public API only
+- **Multi-tenant namespaces**: Optional `namespace` field on all requests (default "default"), filters in both Neo4j and Qdrant
+- **Namespace graph**: `Namespace` nodes linked to `Domain` via `CONTAINS` edges for scoped queries
+- **Web dashboard**: Self-contained SPA with force-directed graph visualization, zero external dependencies
+- **Webhook system**: HMAC-SHA256 signed callbacks, event-type + namespace filtering, stored in Redis
+- **Memory GC**: Scheduled Celery task prunes old memories below score threshold, preserves positive feedback
+- **DLQ cap**: `LTRIM` after every DLQ push prevents unbounded Redis growth (configurable max 10K)
+- **Export/Import**: JSONL streaming for backup/migration, includes both vector and graph data
+- **SSE streaming recall**: Progressive results via Server-Sent Events, no extra dependencies
+- **Embedding hot-swap**: Re-embed all vectors with progress tracking via Celery task state
+- **MCP client lock**: `asyncio.Lock` guards lazy client initialization against TOCTOU races
+- **Lucene phrase search**: Bigrams wrapped in double quotes for correct Lucene phrase matching
 
 ## Development Practices
 
