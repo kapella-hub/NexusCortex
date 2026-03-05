@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import uuid
+from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from typing import Any
 
@@ -154,6 +156,99 @@ class RAGEngine:
         )
 
     # ------------------------------------------------------------------
+    # Streaming recall
+    # ------------------------------------------------------------------
+
+    async def recall_streaming(self, query: ContextQuery) -> AsyncGenerator[dict, None]:
+        """Yield recall results progressively.
+
+        Yields:
+            {"type": "source", "data": MemorySource-like dict}
+            {"type": "context", "data": {"context_block": str, "score": float}}
+            {"type": "done", "data": {"request_id": str, "total_sources": int}}
+        """
+        sources: list[dict[str, Any]] = []
+
+        # Fire both searches concurrently, yield results as each completes
+        async def _vector_search() -> tuple[str, list[dict[str, Any]]]:
+            try:
+                results = await self._vector.search(
+                    query.task,
+                    top_k=query.top_k,
+                    filter_tags=query.tags or None,
+                    namespace=getattr(query, "namespace", "default"),
+                )
+                return "vector", results
+            except Exception:
+                logger.exception("Vector search failed in streaming recall")
+                return "vector", []
+
+        async def _graph_search() -> tuple[str, list[dict[str, Any]]]:
+            try:
+                results = await self._graph.query_related(
+                    query.task, limit=query.top_k,
+                    namespace=getattr(query, "namespace", "default"),
+                )
+                return "graph", results
+            except Exception:
+                logger.exception("Graph query failed in streaming recall")
+                return "graph", []
+
+        vector_task = asyncio.create_task(_vector_search())
+        graph_task = asyncio.create_task(_graph_search())
+
+        for coro in asyncio.as_completed([vector_task, graph_task]):
+            store_name, results = await coro
+
+            if store_name == "vector":
+                for r in results:
+                    text = r.get("text", "")
+                    if not text:
+                        continue
+                    source = {
+                        "store": "vector",
+                        "content": text,
+                        "score": round(float(r.get("score", 0.0)), 4),
+                        "metadata": r.get("metadata", {}),
+                    }
+                    sources.append(source)
+                    yield {"type": "source", "data": source}
+            else:
+                for r in results:
+                    name = r.get("name") or ""
+                    description = r.get("description") or ""
+                    content = description if description else name
+                    if not content:
+                        continue
+                    source = {
+                        "store": "graph",
+                        "content": content,
+                        "score": round(float(r.get("distance", 1) or 1) and 0.5, 4),
+                        "metadata": {
+                            "name": name,
+                            "label": r.get("label", "Entity"),
+                        },
+                    }
+                    sources.append(source)
+                    yield {"type": "source", "data": source}
+
+        # Build context block from all sources
+        context_block = self._format_markdown(sources, query.task, query.top_k)
+        score = max((s["score"] for s in sources), default=0.0)
+
+        yield {
+            "type": "context",
+            "data": {"context_block": context_block, "score": round(score, 4)},
+        }
+        yield {
+            "type": "done",
+            "data": {
+                "request_id": str(uuid.uuid4()),
+                "total_sources": len(sources),
+            },
+        }
+
+    # ------------------------------------------------------------------
     # Retrieval
     # ------------------------------------------------------------------
 
@@ -172,6 +267,7 @@ class RAGEngine:
                     query.task,
                     top_k=query.top_k,
                     filter_tags=query.tags or None,
+                    namespace=getattr(query, "namespace", "default"),
                 )
             except Exception:
                 logger.exception("Vector search failed")
@@ -180,7 +276,8 @@ class RAGEngine:
         async def _safe_graph() -> list[dict[str, Any]]:
             try:
                 return await self._graph.query_related(
-                    query.task, limit=query.top_k
+                    query.task, limit=query.top_k,
+                    namespace=getattr(query, "namespace", "default"),
                 )
             except Exception:
                 logger.exception("Graph query failed")

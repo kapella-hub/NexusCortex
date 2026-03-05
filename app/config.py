@@ -51,8 +51,19 @@ class Settings(BaseSettings):
     RERANK_ENABLED: bool = False
     RERANK_CANDIDATES_MULTIPLIER: int = 2
 
+    # Re-embed
+    REEMBED_BATCH_SIZE: int = 50
+
     # Memory Decay
     MEMORY_DECAY_HALF_LIFE_DAYS: int = 90
+
+    # Garbage Collection
+    MAX_MEMORY_AGE_DAYS: int = 180
+    PRUNE_SCORE_THRESHOLD: float = 0.3
+    GC_SCHEDULE_HOURS: int = 24
+
+    # Namespace
+    DEFAULT_NAMESPACE: str = "default"
 
     # MCP Server
     NEXUS_API_URL: str = "http://localhost:8000"

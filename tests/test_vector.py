@@ -513,3 +513,101 @@ class TestSetFeedback:
                 comment=None,
                 timestamp="2026-03-05T12:00:00+00:00",
             )
+
+
+# ---------------------------------------------------------------------------
+# Namespace support
+# ---------------------------------------------------------------------------
+
+
+class TestNamespaceSupport:
+    @pytest.mark.asyncio
+    async def test_upsert_stores_namespace_in_payload(self, vector_client, mock_qdrant_client):
+        """upsert should store the namespace in the Qdrant payload."""
+        embed_vector = [0.1] * 768
+
+        with patch.object(
+            vector_client, "_embed", new_callable=AsyncMock, return_value=embed_vector
+        ):
+            await vector_client.upsert(
+                text="Fix auth bug",
+                metadata={"source": "action_log", "tags": ["auth"], "domain": "security"},
+                namespace="agent-1",
+            )
+
+        call_kwargs = mock_qdrant_client.upsert.call_args.kwargs
+        points = call_kwargs["points"]
+        assert points[0].payload["namespace"] == "agent-1"
+
+    @pytest.mark.asyncio
+    async def test_upsert_default_namespace_in_payload(self, vector_client, mock_qdrant_client):
+        """upsert without namespace should store 'default' in payload."""
+        embed_vector = [0.1] * 768
+
+        with patch.object(
+            vector_client, "_embed", new_callable=AsyncMock, return_value=embed_vector
+        ):
+            await vector_client.upsert(
+                text="Fix auth bug",
+                metadata={"source": "action_log", "tags": [], "domain": "general"},
+            )
+
+        call_kwargs = mock_qdrant_client.upsert.call_args.kwargs
+        points = call_kwargs["points"]
+        assert points[0].payload["namespace"] == "default"
+
+    @pytest.mark.asyncio
+    async def test_search_filters_by_namespace(self, vector_client, mock_qdrant_client):
+        """search with non-default namespace should add a FieldCondition filter."""
+        result_obj = MagicMock()
+        result_obj.points = []
+        mock_qdrant_client.query_points.return_value = result_obj
+
+        with patch.object(
+            vector_client, "_embed", new_callable=AsyncMock, return_value=[0.1] * 768
+        ):
+            await vector_client.search("auth bug", top_k=5, namespace="agent-1")
+
+        call_kwargs = mock_qdrant_client.query_points.call_args.kwargs
+        query_filter = call_kwargs["query_filter"]
+        assert query_filter is not None
+        # Should have a FieldCondition on "namespace"
+        ns_conditions = [c for c in query_filter.must if c.key == "namespace"]
+        assert len(ns_conditions) == 1
+        assert ns_conditions[0].match.value == "agent-1"
+
+    @pytest.mark.asyncio
+    async def test_search_default_namespace_no_filter(self, vector_client, mock_qdrant_client):
+        """search with default namespace should NOT add namespace filter."""
+        result_obj = MagicMock()
+        result_obj.points = []
+        mock_qdrant_client.query_points.return_value = result_obj
+
+        with patch.object(
+            vector_client, "_embed", new_callable=AsyncMock, return_value=[0.1] * 768
+        ):
+            await vector_client.search("auth bug", top_k=5, namespace="default")
+
+        call_kwargs = mock_qdrant_client.query_points.call_args.kwargs
+        assert call_kwargs["query_filter"] is None
+
+    @pytest.mark.asyncio
+    async def test_search_namespace_combined_with_tags(self, vector_client, mock_qdrant_client):
+        """search with both namespace and tags should include both filters."""
+        result_obj = MagicMock()
+        result_obj.points = []
+        mock_qdrant_client.query_points.return_value = result_obj
+
+        with patch.object(
+            vector_client, "_embed", new_callable=AsyncMock, return_value=[0.1] * 768
+        ):
+            await vector_client.search(
+                "auth bug", top_k=5, filter_tags=["auth"], namespace="agent-1"
+            )
+
+        call_kwargs = mock_qdrant_client.query_points.call_args.kwargs
+        query_filter = call_kwargs["query_filter"]
+        assert query_filter is not None
+        assert len(query_filter.must) == 2
+        keys = {c.key for c in query_filter.must}
+        assert keys == {"tags", "namespace"}

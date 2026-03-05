@@ -25,8 +25,10 @@ from slowapi.util import get_remote_address
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.config import get_settings
+from app.dashboard import create_dashboard_router
 from app.db.graph import Neo4jClient
 from app.db.vector import VectorClient
+from app.embedding_admin import create_embedding_router
 from app.engine.rag import RAGEngine
 from app.exceptions import (
     GraphConnectionError,
@@ -48,6 +50,10 @@ from app.models import (
     ServiceStatus,
     StreamResponse,
 )
+from app.stats import create_stats_router
+from app.streaming import create_streaming_router
+from app.transfer import create_transfer_router
+from app.webhooks import create_webhook_router, fire_webhooks
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -96,6 +102,29 @@ async def lifespan(app: FastAPI):
         http_client=app.state.http_client,
     )
 
+    # Register feature routers
+    app.include_router(create_dashboard_router(
+        graph=app.state.graph_client,
+        vector=app.state.vector_client,
+        redis_client=app.state.redis_client,
+    ))
+    app.include_router(create_webhook_router(app.state.redis_client))
+    app.include_router(create_stats_router(
+        graph=app.state.graph_client,
+        vector=app.state.vector_client,
+        redis_client=app.state.redis_client,
+    ))
+    app.include_router(create_transfer_router(
+        graph=app.state.graph_client,
+        vector=app.state.vector_client,
+    ))
+    app.include_router(create_streaming_router(
+        rag_engine=app.state.rag_engine,
+        graph=app.state.graph_client,
+        vector=app.state.vector_client,
+    ))
+    app.include_router(create_embedding_router(app.state.vector_client))
+
     yield
 
     await app.state.http_client.aclose()
@@ -111,7 +140,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="NexusCortex",
     description="Memory-as-a-Service for LLM agents",
-    version="0.5.0",
+    version="0.6.0",
     lifespan=lifespan,
 )
 
@@ -184,6 +213,7 @@ class APIKeyMiddleware:
     """
 
     SKIP_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
+    SKIP_PREFIXES = ("/dashboard",)
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -193,7 +223,7 @@ class APIKeyMiddleware:
         if scope["type"] == "http":
             if self._api_key is not None:
                 path = scope.get("path", "")
-                if path not in self.SKIP_PATHS:
+                if path not in self.SKIP_PATHS and not path.startswith(self.SKIP_PREFIXES):
                     headers = dict(scope.get("headers", []))
                     api_key = headers.get(b"x-api-key", b"").decode("utf-8", errors="replace")
                     if not hmac.compare_digest(api_key, self._api_key):
@@ -269,7 +299,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type", "X-API-Key", "X-Request-Id"],
 )
 
@@ -422,7 +452,7 @@ async def health(
     return HealthResponse(
         status="ok" if all_connected else "degraded",
         services=services,
-        version="0.5.0",
+        version="0.6.0",
         uptime_seconds=uptime_seconds,
         memory_count=memory_count,
     )
@@ -438,6 +468,7 @@ async def memory_recall(
     """Dual-retrieval memory recall: graph + vector search, merged and scored."""
     result = await engine.recall(query)
     result.request_id = _get_request_id(request)
+    result.namespace = query.namespace
     return result
 
 
@@ -448,6 +479,7 @@ async def memory_learn(
     log: ActionLog,
     graph: Annotated[Neo4jClient, Depends(get_graph)],
     vector: Annotated[VectorClient, Depends(get_vector)],
+    redis_client: Annotated[redis.asyncio.Redis, Depends(get_redis)],
 ) -> LearnResponse:
     """Store an action log in both the knowledge graph and vector store."""
     text = f"{log.action}. The outcome was: {log.outcome}."
@@ -455,7 +487,7 @@ async def memory_learn(
         text += f" Resolution: {log.resolution}"
 
     graph_result, vector_result = await asyncio.gather(
-        graph.merge_action_log(log),
+        graph.merge_action_log(log, namespace=log.namespace),
         vector.upsert(
             text=text,
             metadata={
@@ -463,6 +495,7 @@ async def memory_learn(
                 "tags": log.tags,
                 "domain": log.domain,
             },
+            namespace=log.namespace,
         ),
         return_exceptions=True,
     )
@@ -480,6 +513,7 @@ async def memory_learn(
             status="partial",
             graph_id=None,
             vector_id=str(vector_result),
+            namespace=log.namespace,
         )
 
     if vector_failed:
@@ -488,9 +522,20 @@ async def memory_learn(
             status="partial",
             graph_id=str(graph_result),
             vector_id=None,
+            namespace=log.namespace,
         )
 
-    return LearnResponse(status="stored", graph_id=graph_result, vector_id=vector_result)
+    # Fire webhooks in background (best-effort)
+    try:
+        asyncio.create_task(fire_webhooks(
+            redis_client, "memory.learned",
+            {"graph_id": graph_result, "vector_id": vector_result, "action": log.action},
+            namespace=log.namespace,
+        ))
+    except Exception:
+        pass
+
+    return LearnResponse(status="stored", graph_id=graph_result, vector_id=vector_result, namespace=log.namespace)
 
 
 @app.post("/memory/stream", response_model=StreamResponse)
@@ -519,6 +564,16 @@ async def memory_stream(
         await pipe.execute()
     except Exception as exc:
         raise StreamIngestionError(f"Failed to push events to Redis: {exc}") from exc
+
+    # Fire webhooks in background (best-effort)
+    try:
+        asyncio.create_task(fire_webhooks(
+            redis_client, "stream.ingested",
+            {"count": len(events), "source": events[0].source},
+            namespace=events[0].namespace if events else "default",
+        ))
+    except Exception:
+        pass
 
     return StreamResponse(status="queued", queued=len(events))
 

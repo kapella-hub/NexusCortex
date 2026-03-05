@@ -32,6 +32,7 @@ class TestContextQuery:
         q = ContextQuery(task="anything")
         assert q.tags == []
         assert q.top_k == 5
+        assert q.namespace == "default"
 
     def test_custom_values(self):
         q = ContextQuery(task="search", tags=["auth", "db"], top_k=10)
@@ -41,7 +42,7 @@ class TestContextQuery:
     def test_serialization_roundtrip(self):
         q = ContextQuery(task="Fix login bug", tags=["auth"], top_k=3)
         data = q.model_dump()
-        assert data == {"task": "Fix login bug", "tags": ["auth"], "top_k": 3}
+        assert data == {"task": "Fix login bug", "tags": ["auth"], "top_k": 3, "namespace": "default"}
         q2 = ContextQuery.model_validate(data)
         assert q2 == q
 
@@ -347,3 +348,99 @@ class TestFieldValidation:
         """GenericEventIngest individual tag > 100 chars should be rejected."""
         with pytest.raises(ValidationError):
             GenericEventIngest(source="s", payload={}, tags=["x" * 101])
+
+
+# ---------------------------------------------------------------------------
+# Namespace field validation
+# ---------------------------------------------------------------------------
+
+
+class TestNamespaceValidation:
+    def test_context_query_default_namespace(self):
+        """ContextQuery namespace defaults to 'default'."""
+        q = ContextQuery(task="test")
+        assert q.namespace == "default"
+
+    def test_action_log_default_namespace(self):
+        """ActionLog namespace defaults to 'default'."""
+        log = ActionLog(action="a", outcome="o")
+        assert log.namespace == "default"
+
+    def test_event_ingest_default_namespace(self):
+        """GenericEventIngest namespace defaults to 'default'."""
+        event = GenericEventIngest(source="s", payload={})
+        assert event.namespace == "default"
+
+    def test_recall_response_default_namespace(self):
+        """RecallResponse namespace defaults to 'default'."""
+        rr = RecallResponse(context_block="block", sources=[], score=0.0)
+        assert rr.namespace == "default"
+
+    def test_learn_response_default_namespace(self):
+        """LearnResponse namespace defaults to 'default'."""
+        lr = LearnResponse(status="stored")
+        assert lr.namespace == "default"
+
+    def test_valid_namespace_alphanumeric(self):
+        """Alphanumeric namespace should be accepted."""
+        q = ContextQuery(task="test", namespace="agent1")
+        assert q.namespace == "agent1"
+
+    def test_valid_namespace_with_hyphens(self):
+        """Namespace with hyphens should be accepted."""
+        q = ContextQuery(task="test", namespace="my-agent-1")
+        assert q.namespace == "my-agent-1"
+
+    def test_valid_namespace_with_underscores(self):
+        """Namespace with underscores should be accepted."""
+        q = ContextQuery(task="test", namespace="my_agent_1")
+        assert q.namespace == "my_agent_1"
+
+    def test_namespace_rejects_spaces(self):
+        """Namespace with spaces should be rejected."""
+        with pytest.raises(ValidationError):
+            ContextQuery(task="test", namespace="my agent")
+
+    def test_namespace_rejects_special_chars(self):
+        """Namespace with special characters should be rejected."""
+        for invalid in ["agent@1", "ns/path", "ns.dot", "ns!bang", "ns#hash"]:
+            with pytest.raises(ValidationError):
+                ContextQuery(task="test", namespace=invalid)
+
+    def test_namespace_rejects_empty(self):
+        """Empty namespace should be rejected (min_length=1)."""
+        with pytest.raises(ValidationError):
+            ContextQuery(task="test", namespace="")
+
+    def test_namespace_rejects_too_long(self):
+        """Namespace > 200 chars should be rejected."""
+        with pytest.raises(ValidationError):
+            ContextQuery(task="test", namespace="x" * 201)
+
+    def test_namespace_at_max_length(self):
+        """Namespace exactly 200 chars should be accepted."""
+        q = ContextQuery(task="test", namespace="x" * 200)
+        assert len(q.namespace) == 200
+
+    def test_namespace_on_all_request_models(self):
+        """All request models should accept custom namespaces."""
+        q = ContextQuery(task="test", namespace="tenant-A")
+        assert q.namespace == "tenant-A"
+
+        log = ActionLog(action="a", outcome="o", namespace="tenant-B")
+        assert log.namespace == "tenant-B"
+
+        event = GenericEventIngest(source="s", payload={}, namespace="tenant-C")
+        assert event.namespace == "tenant-C"
+
+    def test_recall_response_custom_namespace(self):
+        """RecallResponse should accept custom namespace."""
+        rr = RecallResponse(
+            context_block="block", sources=[], score=0.0, namespace="agent-1"
+        )
+        assert rr.namespace == "agent-1"
+
+    def test_learn_response_custom_namespace(self):
+        """LearnResponse should accept custom namespace."""
+        lr = LearnResponse(status="stored", namespace="agent-2")
+        assert lr.namespace == "agent-2"

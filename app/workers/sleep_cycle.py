@@ -9,6 +9,7 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+from datetime import timedelta
 from typing import Any
 
 import httpx
@@ -43,6 +44,10 @@ def _create_celery_app() -> Celery:
             "sleep-cycle-consolidation": {
                 "task": "app.workers.sleep_cycle.process_event_batch",
                 "schedule": 60.0,
+            },
+            "memory-gc": {
+                "task": "app.workers.gc.prune_memories",
+                "schedule": timedelta(hours=s.GC_SCHEDULE_HOURS),
             },
         },
     )

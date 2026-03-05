@@ -255,10 +255,11 @@ class Neo4jClient:
     # Write operations
     # ------------------------------------------------------------------
 
-    async def merge_action_log(self, log: ActionLog) -> str:
+    async def merge_action_log(self, log: ActionLog, namespace: str = "default") -> str:
         """Persist an action log as a Domain->Action->Outcome->Resolution chain.
 
         Creates Concept nodes for each tag and links them to the Action.
+        Creates a Namespace node and links Domain to it via CONTAINS.
         Returns the element ID of the Action node.
 
         All writes are wrapped in a single explicit transaction so that
@@ -270,7 +271,9 @@ class Neo4jClient:
         outcome_id = self._content_hash(log.outcome)
 
         query = """
+        MERGE (ns:Namespace {name: $namespace})
         MERGE (d:Domain {name: $domain})
+        MERGE (ns)-[:CONTAINS]->(d)
         MERGE (a:Action {id: $action_id})
         SET a.description = $action
         MERGE (o:Outcome {id: $outcome_id})
@@ -302,6 +305,7 @@ class Neo4jClient:
                 try:
                     result = await tx.run(
                         query,
+                        namespace=namespace,
                         domain=domain,
                         action=log.action,
                         action_id=action_id,
@@ -479,13 +483,16 @@ class Neo4jClient:
     # ------------------------------------------------------------------
 
     async def query_related(
-        self, concept: str, limit: int = 10
+        self, concept: str, limit: int = 10, namespace: str = "default"
     ) -> list[dict[str, Any]]:
         """Find nodes related to a concept via graph traversal (up to 3 hops).
 
         Tries fulltext index search first for relevance-scored results.
         Falls back to CONTAINS-based keyword matching if the fulltext
         index is not available.
+
+        When namespace is not "default", results are filtered to nodes
+        reachable from the given Namespace node via CONTAINS relationships.
         """
         keywords = self._extract_keywords(concept)
         if not keywords:
@@ -498,15 +505,15 @@ class Neo4jClient:
         effective_limit = min(limit, 50)
 
         # Try fulltext search first
-        result = await self._query_related_fulltext(expanded, effective_limit)
+        result = await self._query_related_fulltext(expanded, effective_limit, namespace)
         if result is not None:
             return result
 
         # Fallback to CONTAINS-based search
-        return await self._query_related_contains(expanded, effective_limit)
+        return await self._query_related_contains(expanded, effective_limit, namespace)
 
     async def _query_related_fulltext(
-        self, keywords: list[str], limit: int
+        self, keywords: list[str], limit: int, namespace: str = "default"
     ) -> list[dict[str, Any]] | None:
         """Try fulltext index search. Returns None if index doesn't exist."""
         # Build Lucene query string: OR-join all keywords
@@ -524,7 +531,19 @@ class Neo4jClient:
                 parts.append(escaped)
         search_terms = " OR ".join(parts)
 
-        query = """
+        # Build namespace filter clause
+        ns_filter = ""
+        params: dict[str, Any] = {
+            "search_terms": search_terms,
+            "limit": limit,
+        }
+        if namespace != "default":
+            ns_filter = (
+                "AND EXISTS((result)<-[:CONTAINS*..3]-(:Namespace {name: $namespace}))"
+            )
+            params["namespace"] = namespace
+
+        query = f"""
         CALL db.index.fulltext.queryNodes('node_fulltext', $search_terms)
         YIELD node, score
         WITH node AS start, score
@@ -537,6 +556,7 @@ class Neo4jClient:
             COALESCE(related, start) AS result,
             score,
             CASE WHEN related IS NULL THEN 0 ELSE length(r) END AS distance
+        WHERE true {ns_filter}
         RETURN result.name AS name,
                result.description AS description,
                labels(result)[0] AS label,
@@ -549,9 +569,7 @@ class Neo4jClient:
         driver = self._ensure_driver()
         try:
             async with driver.session() as session:
-                result = await session.run(
-                    query, search_terms=search_terms, limit=limit
-                )
+                result = await session.run(query, **params)
                 return [dict(record) async for record in result]
         except neo4j.exceptions.ClientError:
             # Fulltext index may not exist — fall back gracefully
@@ -561,7 +579,7 @@ class Neo4jClient:
             return None
 
     async def _query_related_contains(
-        self, keywords: list[str], limit: int
+        self, keywords: list[str], limit: int, namespace: str = "default"
     ) -> list[dict[str, Any]]:
         """Fallback CONTAINS-based keyword search with label filtering."""
         # Build OR-chained CONTAINS conditions for each keyword.
@@ -576,6 +594,14 @@ class Neo4jClient:
             )
         where_clause = " OR ".join(conditions)
 
+        # Build namespace filter clause
+        ns_filter = ""
+        if namespace != "default":
+            ns_filter = (
+                "AND EXISTS((related)<-[:CONTAINS*..3]-(:Namespace {name: $namespace}))"
+            )
+            params["namespace"] = namespace
+
         # Label-bounded traversal
         query = f"""
         MATCH (start)-[r*1..3]-(related)
@@ -584,6 +610,7 @@ class Neo4jClient:
           AND ({where_clause})
           AND (related:Domain OR related:Concept OR related:Action
                OR related:Outcome OR related:Resolution)
+          {ns_filter}
         RETURN DISTINCT related.name AS name,
                related.description AS description,
                labels(related)[0] AS label,
@@ -603,13 +630,220 @@ class Neo4jClient:
                 f"Failed to query related concepts: {exc}"
             ) from exc
 
+    async def get_graph_snapshot(self, concept: str | None = None, limit: int = 50) -> dict:
+        """Return nodes and edges for visualization.
+
+        If concept is provided, get subgraph around it (2 hops).
+        Otherwise get a sample of nodes with their edges.
+        Returns {"nodes": [...], "edges": [...]}.
+        """
+        driver = self._ensure_driver()
+        effective_limit = min(limit, 200)
+
+        try:
+            async with driver.session() as session:
+                if concept:
+                    canon = self._canonicalize(concept)
+                    query = """
+                    MATCH (center)
+                    WHERE (center:Domain OR center:Concept OR center:Action
+                           OR center:Outcome OR center:Resolution)
+                      AND toLower(center.name) CONTAINS $concept
+                    WITH center LIMIT 1
+                    OPTIONAL MATCH path = (center)-[*1..2]-(neighbor)
+                    WHERE neighbor:Domain OR neighbor:Concept OR neighbor:Action
+                          OR neighbor:Outcome OR neighbor:Resolution
+                    WITH collect(DISTINCT center) + collect(DISTINCT neighbor) AS allNodes,
+                         collect(DISTINCT path) AS paths
+                    UNWIND allNodes AS n
+                    WITH collect(DISTINCT n) AS nodes, paths
+                    UNWIND paths AS p
+                    UNWIND relationships(p) AS rel
+                    WITH nodes,
+                         collect(DISTINCT {
+                             source: elementId(startNode(rel)),
+                             target: elementId(endNode(rel)),
+                             type: type(rel)
+                         }) AS edges
+                    UNWIND nodes AS n
+                    RETURN collect(DISTINCT {
+                        id: elementId(n),
+                        label: labels(n)[0],
+                        name: COALESCE(n.name, n.description, n.id, 'unnamed')
+                    }) AS nodes, edges
+                    """
+                    result = await session.run(query, concept=canon)
+                else:
+                    query = """
+                    MATCH (n)
+                    WHERE n:Domain OR n:Concept OR n:Action
+                          OR n:Outcome OR n:Resolution
+                    WITH n LIMIT $limit
+                    OPTIONAL MATCH (n)-[r]-(m)
+                    WHERE m:Domain OR m:Concept OR m:Action
+                          OR m:Outcome OR m:Resolution
+                    WITH collect(DISTINCT {
+                        id: elementId(n),
+                        label: labels(n)[0],
+                        name: COALESCE(n.name, n.description, n.id, 'unnamed')
+                    }) + collect(DISTINCT {
+                        id: elementId(m),
+                        label: labels(m)[0],
+                        name: COALESCE(m.name, m.description, m.id, 'unnamed')
+                    }) AS allNodes,
+                    collect(DISTINCT {
+                        source: elementId(startNode(r)),
+                        target: elementId(endNode(r)),
+                        type: type(r)
+                    }) AS edges
+                    UNWIND allNodes AS node
+                    RETURN collect(DISTINCT node) AS nodes, edges
+                    """
+                    result = await session.run(query, limit=effective_limit)
+
+                record = await result.single()
+                if record is None:
+                    return {"nodes": [], "edges": []}
+
+                nodes = [dict(n) for n in record["nodes"]] if record["nodes"] else []
+                edges = [dict(e) for e in record["edges"]] if record["edges"] else []
+                # Filter out null-source/target edges
+                edges = [e for e in edges if e.get("source") and e.get("target")]
+                return {"nodes": nodes, "edges": edges}
+        except Exception as exc:
+            logger.error("Failed to get graph snapshot: %s", exc)
+            return {"nodes": [], "edges": []}
+
+    async def get_node_edge_counts(self) -> dict:
+        """Return {"nodes": int, "edges": int}."""
+        driver = self._ensure_driver()
+        try:
+            async with driver.session() as session:
+                node_result = await session.run(
+                    "MATCH (n) WHERE n:Domain OR n:Concept OR n:Action "
+                    "OR n:Outcome OR n:Resolution RETURN count(n) AS cnt"
+                )
+                node_record = await node_result.single()
+                node_count = node_record["cnt"] if node_record else 0
+
+                edge_result = await session.run(
+                    "MATCH ()-[r]->() RETURN count(r) AS cnt"
+                )
+                edge_record = await edge_result.single()
+                edge_count = edge_record["cnt"] if edge_record else 0
+
+                return {"nodes": node_count, "edges": edge_count}
+        except Exception as exc:
+            logger.error("Failed to get node/edge counts: %s", exc)
+            return {"nodes": 0, "edges": 0}
+
+    async def get_stats(self) -> dict:
+        """Return graph statistics: node_count, edge_count, domains, top_tags."""
+        driver = self._ensure_driver()
+        try:
+            async with driver.session() as session:
+                node_result = await session.run(
+                    "MATCH (n) WHERE n:Domain OR n:Concept OR n:Action "
+                    "OR n:Outcome OR n:Resolution RETURN count(n) AS cnt"
+                )
+                node_record = await node_result.single()
+                node_count = node_record["cnt"] if node_record else 0
+
+                edge_result = await session.run(
+                    "MATCH ()-[r]->() RETURN count(r) AS cnt"
+                )
+                edge_record = await edge_result.single()
+                edge_count = edge_record["cnt"] if edge_record else 0
+
+                domain_result = await session.run(
+                    "MATCH (d:Domain) RETURN d.name AS domain"
+                )
+                domains = [record["domain"] async for record in domain_result if record["domain"]]
+
+                tag_result = await session.run(
+                    "MATCH (c:Concept)<-[:RELATES_TO]-() "
+                    "RETURN c.name AS tag, count(*) AS cnt "
+                    "ORDER BY cnt DESC LIMIT 20"
+                )
+                top_tags = [
+                    {"tag": record["tag"], "count": record["cnt"]}
+                    async for record in tag_result
+                    if record["tag"]
+                ]
+
+                return {
+                    "node_count": node_count,
+                    "edge_count": edge_count,
+                    "domains": domains,
+                    "top_tags": top_tags,
+                }
+        except Exception as exc:
+            logger.error("Failed to get graph stats: %s", exc)
+            return {"node_count": 0, "edge_count": 0, "domains": [], "top_tags": []}
+
+    async def export_graph(self) -> dict:
+        """Export all nodes and edges.
+
+        Returns {"nodes": [...], "edges": [...]}.
+        """
+        driver = self._ensure_driver()
+        try:
+            async with driver.session() as session:
+                node_result = await session.run(
+                    "MATCH (n) WHERE n:Domain OR n:Concept OR n:Action "
+                    "OR n:Outcome OR n:Resolution "
+                    "RETURN elementId(n) AS id, labels(n)[0] AS label, "
+                    "properties(n) AS properties"
+                )
+                nodes = [
+                    {
+                        "id": record["id"],
+                        "label": record["label"],
+                        "properties": dict(record["properties"]) if record["properties"] else {},
+                    }
+                    async for record in node_result
+                ]
+
+                edge_result = await session.run(
+                    "MATCH (n)-[r]->(m) "
+                    "WHERE (n:Domain OR n:Concept OR n:Action OR n:Outcome OR n:Resolution) "
+                    "AND (m:Domain OR m:Concept OR m:Action OR m:Outcome OR m:Resolution) "
+                    "RETURN elementId(n) AS source, elementId(m) AS target, type(r) AS type"
+                )
+                edges = [
+                    {
+                        "source": record["source"],
+                        "target": record["target"],
+                        "type": record["type"],
+                    }
+                    async for record in edge_result
+                ]
+
+                return {"nodes": nodes, "edges": edges}
+        except Exception as exc:
+            logger.error("Failed to export graph: %s", exc)
+            return {"nodes": [], "edges": []}
+
     async def query_resolutions(
-        self, error_pattern: str, limit: int = 5
+        self, error_pattern: str, limit: int = 5, namespace: str = "default"
     ) -> list[dict[str, Any]]:
         """Find resolutions for outcomes matching the given error pattern."""
-        query = """
+        params: dict[str, Any] = {
+            "error_pattern": error_pattern,
+            "limit": limit,
+        }
+
+        ns_filter = ""
+        if namespace != "default":
+            ns_filter = (
+                "AND EXISTS((r)<-[:CONTAINS*..3]-(:Namespace {name: $namespace}))"
+            )
+            params["namespace"] = namespace
+
+        query = f"""
         MATCH (o:Outcome)-[:RESOLVED_BY]->(r:Resolution)
         WHERE toLower(o.description) CONTAINS toLower($error_pattern)
+        {ns_filter}
         RETURN r.description AS resolution,
                o.description AS error,
                elementId(r) AS id
@@ -618,9 +852,7 @@ class Neo4jClient:
         driver = self._ensure_driver()
         try:
             async with driver.session() as session:
-                result = await session.run(
-                    query, error_pattern=error_pattern, limit=limit
-                )
+                result = await session.run(query, **params)
                 return [dict(record) async for record in result]
         except GraphConnectionError:
             raise

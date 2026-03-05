@@ -17,6 +17,7 @@ class ContextQuery(BaseModel):
     task: str = Field(..., min_length=1, max_length=2000)
     tags: list[Annotated[str, Field(max_length=100)]] = Field(default=[], max_length=20)
     top_k: int = Field(default=5, ge=1, le=100)
+    namespace: str = Field(default="default", min_length=1, max_length=200, pattern=r"^[a-zA-Z0-9_-]+$")
 
     model_config = {
         "json_schema_extra": {
@@ -39,6 +40,7 @@ class ActionLog(BaseModel):
     resolution: str | None = Field(default=None, max_length=5000)
     tags: list[Annotated[str, Field(max_length=100)]] = Field(default=[], max_length=20)
     domain: str = Field(default="general", min_length=1, max_length=200)
+    namespace: str = Field(default="default", min_length=1, max_length=200, pattern=r"^[a-zA-Z0-9_-]+$")
 
     model_config = {
         "json_schema_extra": {
@@ -65,6 +67,7 @@ class GenericEventIngest(BaseModel):
     payload: dict[str, Any]
     timestamp: datetime | None = None
     tags: list[Annotated[str, Field(max_length=100)]] = Field(default=[], max_length=20)
+    namespace: str = Field(default="default", min_length=1, max_length=200, pattern=r"^[a-zA-Z0-9_-]+$")
 
     @model_validator(mode="after")
     def _validate_payload_size(self) -> "GenericEventIngest":
@@ -119,6 +122,7 @@ class RecallResponse(BaseModel):
     sources: list[MemorySource]
     score: float
     request_id: str | None = None
+    namespace: str = "default"
 
 
 class LearnResponse(BaseModel):
@@ -127,6 +131,7 @@ class LearnResponse(BaseModel):
     status: str
     graph_id: str | None = None
     vector_id: str | None = None
+    namespace: str = "default"
 
 
 class StreamResponse(BaseModel):
@@ -148,7 +153,7 @@ class HealthResponse(BaseModel):
 
     status: str
     services: dict[str, ServiceStatus]
-    version: str = "0.5.0"
+    version: str = "0.6.0"
     uptime_seconds: float | None = None
     memory_count: int | None = None
 
@@ -180,3 +185,32 @@ class FeedbackResponse(BaseModel):
 
     status: str
     updated: int
+
+
+# ---------------------------------------------------------------------------
+# Stats & Transfer Models
+# ---------------------------------------------------------------------------
+
+
+class MemoryStats(BaseModel):
+    """Response from /memory/stats — aggregated memory statistics."""
+
+    total_memories: int
+    graph_nodes: int
+    graph_edges: int
+    domains: list[str]
+    top_tags: list[dict]  # [{"tag": "auth", "count": 15}, ...]
+    dlq_depth: int
+    oldest_memory: str | None  # ISO timestamp
+    newest_memory: str | None  # ISO timestamp
+    namespace_counts: dict[str, int]  # {"default": 42, "agent-1": 15}
+
+
+class ImportResponse(BaseModel):
+    """Response from /memory/import."""
+
+    status: str
+    imported_memories: int = 0
+    imported_nodes: int = 0
+    imported_edges: int = 0
+    errors: list[str] = []

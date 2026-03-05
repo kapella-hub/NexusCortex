@@ -21,6 +21,7 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     MatchAny,
+    MatchValue,
     PayloadSchemaType,
     PointStruct,
     VectorParams,
@@ -87,15 +88,16 @@ class VectorClient:
                 f"Failed to initialize Qdrant collection: {exc}"
             ) from exc
 
-        # Create payload index on tags for faster filtered queries
-        try:
-            await self._client.create_payload_index(
-                collection_name=self._collection,
-                field_name="tags",
-                field_schema=PayloadSchemaType.KEYWORD,
-            )
-        except Exception:
-            pass  # Index may already exist
+        # Create payload indexes for faster filtered queries
+        for field_name in ("tags", "namespace"):
+            try:
+                await self._client.create_payload_index(
+                    collection_name=self._collection,
+                    field_name=field_name,
+                    field_schema=PayloadSchemaType.KEYWORD,
+                )
+            except Exception:
+                pass  # Index may already exist
 
     async def close(self) -> None:
         """Close the underlying Qdrant and HTTP clients."""
@@ -115,13 +117,210 @@ class VectorClient:
         except Exception:
             return None
 
-    async def upsert(self, text: str, metadata: dict[str, Any]) -> str:
+    async def get_stats(self) -> dict:
+        """Return vector store statistics.
+
+        Scrolls a sample of points to find oldest/newest timestamps
+        and namespace (domain) distribution.
+        """
+        try:
+            info = await self._client.get_collection(self._collection)
+            total = info.points_count or 0
+        except Exception:
+            return {
+                "total": 0,
+                "oldest_memory": None,
+                "newest_memory": None,
+                "namespace_counts": {},
+            }
+
+        oldest: str | None = None
+        newest: str | None = None
+        namespace_counts: dict[str, int] = {}
+
+        # Scroll through all points to aggregate stats
+        offset = None
+        while True:
+            try:
+                records, next_offset = await self._client.scroll(
+                    collection_name=self._collection,
+                    scroll_filter=None,
+                    limit=256,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            except Exception:
+                break
+
+            if not records:
+                break
+
+            for point in records:
+                payload = point.payload or {}
+                ts = payload.get("timestamp")
+                if ts:
+                    ts_str = str(ts)
+                    if oldest is None or ts_str < oldest:
+                        oldest = ts_str
+                    if newest is None or ts_str > newest:
+                        newest = ts_str
+                domain = payload.get("domain", "default")
+                namespace_counts[domain] = namespace_counts.get(domain, 0) + 1
+
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        return {
+            "total": total,
+            "oldest_memory": oldest,
+            "newest_memory": newest,
+            "namespace_counts": namespace_counts,
+        }
+
+    async def scroll_all(self, namespace: str | None = None, batch_size: int = 100):
+        """Async generator that yields all points, optionally filtered by namespace.
+
+        Yields dicts with id, text, metadata, namespace.
+        """
+        scroll_filter = None
+        if namespace:
+            scroll_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="domain",
+                        match=MatchAny(any=[namespace]),
+                    )
+                ]
+            )
+
+        offset = None
+        while True:
+            try:
+                records, next_offset = await self._client.scroll(
+                    collection_name=self._collection,
+                    scroll_filter=scroll_filter,
+                    limit=batch_size,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            except Exception:
+                break
+
+            if not records:
+                break
+
+            for point in records:
+                payload = point.payload or {}
+                yield {
+                    "id": str(point.id),
+                    "text": payload.get("text", ""),
+                    "metadata": payload.get("metadata", {}),
+                    "namespace": payload.get("domain", "default"),
+                    "tags": payload.get("tags", []),
+                    "source": payload.get("source", ""),
+                    "created_at": payload.get("timestamp", ""),
+                }
+
+            if next_offset is None:
+                break
+            offset = next_offset
+
+    async def list_memories(
+        self,
+        limit: int = 20,
+        offset: int = 0,
+        query: str | None = None,
+        namespace: str | None = None,
+    ) -> list[dict]:
+        """List memories with optional search.
+
+        If query is provided, do semantic search. Otherwise scroll through points.
+        If namespace is provided, filter by domain.
+        """
+        effective_limit = min(limit, 100)
+
+        try:
+            if query:
+                # Semantic search
+                filter_tags = None
+                query_filter = None
+                if namespace:
+                    query_filter = Filter(
+                        must=[
+                            FieldCondition(
+                                key="domain",
+                                match=MatchAny(any=[namespace]),
+                            )
+                        ]
+                    )
+                vector = await self._embed(query)
+                results = await self._client.query_points(
+                    collection_name=self._collection,
+                    query=vector,
+                    query_filter=query_filter,
+                    limit=effective_limit + offset,
+                    with_payload=True,
+                )
+                points = results.points[offset:]
+                return [
+                    {
+                        "id": str(p.id),
+                        "score": p.score,
+                        "text": p.payload.get("text", "") if p.payload else "",
+                        "domain": p.payload.get("domain", "") if p.payload else "",
+                        "tags": p.payload.get("tags", []) if p.payload else [],
+                        "timestamp": p.payload.get("timestamp", "") if p.payload else "",
+                        "source": p.payload.get("source", "") if p.payload else "",
+                    }
+                    for p in points
+                ]
+            else:
+                # Scroll through points
+                scroll_filter = None
+                if namespace:
+                    scroll_filter = Filter(
+                        must=[
+                            FieldCondition(
+                                key="domain",
+                                match=MatchAny(any=[namespace]),
+                            )
+                        ]
+                    )
+                records, _next_offset = await self._client.scroll(
+                    collection_name=self._collection,
+                    scroll_filter=scroll_filter,
+                    limit=effective_limit + offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                points = records[offset:]
+                return [
+                    {
+                        "id": str(p.id),
+                        "score": None,
+                        "text": p.payload.get("text", "") if p.payload else "",
+                        "domain": p.payload.get("domain", "") if p.payload else "",
+                        "tags": p.payload.get("tags", []) if p.payload else [],
+                        "timestamp": p.payload.get("timestamp", "") if p.payload else "",
+                        "source": p.payload.get("source", "") if p.payload else "",
+                    }
+                    for p in points
+                ]
+        except Exception as exc:
+            logger.error("Failed to list memories: %s", exc)
+            return []
+
+    async def upsert(self, text: str, metadata: dict[str, Any], namespace: str = "default") -> str:
         """Embed text and upsert into Qdrant.
 
         Args:
             text: The text content to embed and store.
             metadata: Must include 'source', 'tags', 'domain'.
                       Additional keys are stored under 'metadata'.
+            namespace: Tenant namespace for multi-tenant isolation.
 
         Returns:
             The generated point ID as a string.
@@ -135,6 +334,7 @@ class VectorClient:
                 "source": metadata.get("source", "unknown"),
                 "tags": metadata.get("tags", []),
                 "domain": metadata.get("domain", "general"),
+                "namespace": namespace,
                 "timestamp": metadata.get(
                     "timestamp",
                     datetime.now(timezone.utc).isoformat(),
@@ -169,6 +369,7 @@ class VectorClient:
         query: str,
         top_k: int = 5,
         filter_tags: list[str] | None = None,
+        namespace: str = "default",
     ) -> list[dict[str, Any]]:
         """Embed query and search Qdrant for similar vectors.
 
@@ -176,6 +377,7 @@ class VectorClient:
             query: The search query text.
             top_k: Maximum number of results to return.
             filter_tags: Optional list of tags to filter on (match any).
+            namespace: Tenant namespace for multi-tenant filtering.
 
         Returns:
             List of dicts with id, score, text, and metadata.
@@ -183,16 +385,22 @@ class VectorClient:
         try:
             vector = await self._embed(query)
 
-            query_filter = None
+            filter_conditions = []
             if filter_tags:
-                query_filter = Filter(
-                    must=[
-                        FieldCondition(
-                            key="tags",
-                            match=MatchAny(any=filter_tags),
-                        )
-                    ]
+                filter_conditions.append(
+                    FieldCondition(
+                        key="tags",
+                        match=MatchAny(any=filter_tags),
+                    )
                 )
+            if namespace != "default":
+                filter_conditions.append(
+                    FieldCondition(
+                        key="namespace",
+                        match=MatchValue(value=namespace),
+                    )
+                )
+            query_filter = Filter(must=filter_conditions) if filter_conditions else None
 
             results = await self._client.query_points(
                 collection_name=self._collection,
@@ -383,6 +591,21 @@ class VectorClient:
             },
             points=[memory_id],
         )
+
+    async def get_embedding_info(self) -> dict:
+        """Return embedding model info: model name, dimensions, cache size, total vectors."""
+        collection_info = await self._client.get_collection(self._collection)
+        return {
+            "model": self._embedding_model,
+            "dimensions": self._embedding_dim,
+            "cache_size": len(self._embed_cache),
+            "cache_max_size": _EMBED_CACHE_MAX_SIZE,
+            "total_vectors": collection_info.points_count,
+        }
+
+    def clear_cache(self) -> None:
+        """Clear the embedding cache."""
+        self._embed_cache.clear()
 
     def _cache_put(self, key: str, value: list[float]) -> None:
         """Insert into the embedding cache with LRU eviction."""

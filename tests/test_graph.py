@@ -447,3 +447,91 @@ class TestQueryResolutions:
 
         with pytest.raises(GraphConnectionError, match="Failed to query resolutions"):
             await client_with_driver.query_resolutions("error")
+
+
+# ---------------------------------------------------------------------------
+# Namespace support
+# ---------------------------------------------------------------------------
+
+
+class TestNamespaceSupport:
+    @pytest.mark.asyncio
+    async def test_merge_action_log_creates_namespace_node(self, client_with_driver):
+        """merge_action_log should include Namespace MERGE in the Cypher query."""
+        tx = client_with_driver._mock_tx
+        mock_result = AsyncMock()
+        mock_result.single = AsyncMock(return_value={"id": "elem-ns-1"})
+        tx.run = AsyncMock(return_value=mock_result)
+
+        log = ActionLog(action="a", outcome="o", domain="infra")
+        await client_with_driver.merge_action_log(log, namespace="agent-1")
+
+        call_args = tx.run.call_args
+        query = call_args[0][0]
+        # Cypher should contain Namespace MERGE
+        assert "MERGE (ns:Namespace {name: $namespace})" in query
+        assert "MERGE (ns)-[:CONTAINS]->(d)" in query
+        # Parameter should be passed
+        call_kwargs = call_args.kwargs
+        assert call_kwargs["namespace"] == "agent-1"
+
+    @pytest.mark.asyncio
+    async def test_merge_action_log_default_namespace(self, client_with_driver):
+        """merge_action_log without explicit namespace should use 'default'."""
+        tx = client_with_driver._mock_tx
+        mock_result = AsyncMock()
+        mock_result.single = AsyncMock(return_value={"id": "elem-ns-2"})
+        tx.run = AsyncMock(return_value=mock_result)
+
+        log = ActionLog(action="a", outcome="o")
+        await client_with_driver.merge_action_log(log)
+
+        call_kwargs = tx.run.call_args.kwargs
+        assert call_kwargs["namespace"] == "default"
+
+    @pytest.mark.asyncio
+    async def test_query_related_filters_by_namespace(self, client_with_driver):
+        """query_related with non-default namespace should add namespace filter."""
+        session = client_with_driver._mock_session
+
+        mock_result = MagicMock()
+
+        async def _aiter():
+            return
+            yield
+
+        mock_result.__aiter__ = lambda self: _aiter()
+        session.run = AsyncMock(return_value=mock_result)
+
+        await client_with_driver.query_related(
+            "authentication timeout", limit=5, namespace="agent-1"
+        )
+
+        call_args = session.run.call_args
+        query = call_args[0][0]
+        # Should contain namespace filter
+        assert "Namespace" in query
+        assert "namespace" in (call_args.kwargs or {})
+
+    @pytest.mark.asyncio
+    async def test_query_related_default_namespace_no_filter(self, client_with_driver):
+        """query_related with default namespace should NOT add namespace filter."""
+        session = client_with_driver._mock_session
+
+        mock_result = MagicMock()
+
+        async def _aiter():
+            return
+            yield
+
+        mock_result.__aiter__ = lambda self: _aiter()
+        session.run = AsyncMock(return_value=mock_result)
+
+        await client_with_driver.query_related(
+            "authentication timeout", limit=5, namespace="default"
+        )
+
+        call_args = session.run.call_args
+        query = call_args[0][0]
+        # Should NOT contain namespace filter for default
+        assert "Namespace {name:" not in query
