@@ -234,7 +234,7 @@ class RAGEngine:
                     source = {
                         "store": "graph",
                         "content": content,
-                        "score": round(float(r.get("distance", 1) or 1) and 0.5, 4),
+                        "score": round(1.0 / max(float(r.get("distance", 1) or 1), 1), 4),
                         "metadata": {
                             "name": name,
                             "label": r.get("label", "Entity"),

@@ -145,7 +145,8 @@ def create_transfer_router(graph: Neo4jClient, vector: VectorClient) -> APIRoute
                     metadata["tags"] = item.get("tags", metadata.get("tags", []))
                     metadata["source"] = item.get("source", metadata.get("source", "import"))
                     metadata["timestamp"] = item.get("created_at", "")
-                    await vector.upsert(text=text, metadata=metadata)
+                    ns = item.get("namespace", "default")
+                    await vector.upsert(text=text, metadata=metadata, namespace=ns)
                     imported_memories += 1
                 except Exception as exc:
                     errors.append(f"Item {idx}: failed to import memory: {exc}")

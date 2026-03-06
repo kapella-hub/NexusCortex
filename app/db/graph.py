@@ -825,12 +825,19 @@ class Neo4jClient:
             return {"nodes": [], "edges": []}
 
     async def create_supersession(self, newer_id: str, older_id: str, reason: str, detected: str = "auto") -> None:
-        """Create a SUPERSEDES edge between two action nodes."""
+        """Create a SUPERSEDES edge between two nodes.
+
+        newer_id is a Neo4j element ID. older_id can be either a Neo4j
+        element ID or a Qdrant vector UUID (matched via MemoryRef nodes).
+        """
         driver = self._ensure_driver()
         async with driver.session() as session:
             await session.run(
                 "MATCH (newer) WHERE elementId(newer) = $newer_id "
-                "MATCH (older) WHERE elementId(older) = $older_id "
+                "OPTIONAL MATCH (older_by_eid) WHERE elementId(older_by_eid) = $older_id "
+                "OPTIONAL MATCH (older_by_ref:MemoryRef {vector_id: $older_id}) "
+                "WITH newer, COALESCE(older_by_eid, older_by_ref) AS older "
+                "WHERE older IS NOT NULL "
                 "MERGE (newer)-[:SUPERSEDES {reason: $reason, detected: $detected, timestamp: datetime()}]->(older)",
                 newer_id=newer_id, older_id=older_id, reason=reason, detected=detected,
             )

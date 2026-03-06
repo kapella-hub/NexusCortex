@@ -116,7 +116,7 @@ async def fire_webhooks(
 
     tasks = [_send_webhook(wh, body) for wh in matching]
     # Fire-and-forget: gather but don't block callers
-    asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _send_webhook(webhook: WebhookRegistration, body: dict[str, Any]) -> None:

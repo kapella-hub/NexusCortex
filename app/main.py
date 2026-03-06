@@ -203,11 +203,14 @@ class RequestBodySizeLimitMiddleware:
             try:
                 await self.app(scope, receive_with_limit, send)
             except _BodyTooLargeError:
-                response = JSONResponse(
-                    status_code=413,
-                    content={"detail": "Request body too large"},
-                )
-                await response(scope, receive, send)
+                try:
+                    response = JSONResponse(
+                        status_code=413,
+                        content={"detail": "Request body too large"},
+                    )
+                    await response(scope, receive, send)
+                except Exception:
+                    pass
             return
         await self.app(scope, receive, send)
 

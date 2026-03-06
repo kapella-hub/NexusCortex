@@ -650,3 +650,90 @@ class TestLifecycleScoring:
         items = [{"score": 1.0, "content": "test", "metadata": {"status": "superseded", "superseded_by": "new-id"}}]
         result = engine._apply_lifecycle_scoring(items)
         assert result[0]["_superseded_by"] == "new-id"
+
+
+# ---------------------------------------------------------------------------
+# _apply_decay
+# ---------------------------------------------------------------------------
+
+
+class TestApplyDecay:
+    def test_no_decay_when_half_life_zero(self, engine):
+        """No decay should be applied when half-life is 0."""
+        engine._settings.MEMORY_DECAY_HALF_LIFE_DAYS = 0
+        items = [{"score": 1.0, "metadata": {"timestamp": "2020-01-01T00:00:00+00:00"}}]
+        engine._apply_decay(items)
+        assert items[0]["score"] == 1.0
+
+    def test_decay_reduces_old_scores(self, engine):
+        """Very old memories should have near-zero scores."""
+        engine._settings.MEMORY_DECAY_HALF_LIFE_DAYS = 90
+        items = [{"score": 1.0, "metadata": {"timestamp": "2020-01-01T00:00:00+00:00"}}]
+        engine._apply_decay(items)
+        assert items[0]["score"] < 0.01
+
+    def test_no_decay_without_timestamp(self, engine):
+        """Items without timestamp should keep original score."""
+        items = [{"score": 0.8, "metadata": {}}]
+        engine._apply_decay(items)
+        assert items[0]["score"] == 0.8
+
+    def test_recent_memory_minimal_decay(self, engine):
+        """Recent memories should have minimal decay."""
+        from datetime import datetime, timezone, timedelta
+        engine._settings.MEMORY_DECAY_HALF_LIFE_DAYS = 90
+        recent = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        items = [{"score": 1.0, "metadata": {"timestamp": recent}}]
+        engine._apply_decay(items)
+        assert items[0]["score"] > 0.99
+
+
+# ---------------------------------------------------------------------------
+# _apply_lifecycle_scoring (extended)
+# ---------------------------------------------------------------------------
+
+
+class TestApplyLifecycleScoring:
+    def test_active_memory_full_score(self, engine):
+        """Active memories should keep full score."""
+        items = [{"score": 1.0, "metadata": {"status": "active", "confirmed_count": 0, "contradicted_count": 0}}]
+        engine._apply_lifecycle_scoring(items)
+        assert items[0]["score"] == 1.0
+
+    def test_superseded_memory_half_score(self, engine):
+        """Superseded memories should get 0.5 multiplier."""
+        items = [{"score": 1.0, "metadata": {"status": "superseded", "confirmed_count": 0, "contradicted_count": 0}}]
+        result = engine._apply_lifecycle_scoring(items)
+        assert result[0]["score"] == 0.5
+
+    def test_deprecated_memory_low_score(self, engine):
+        """Deprecated memories should get 0.1 multiplier."""
+        items = [{"score": 1.0, "metadata": {"status": "deprecated", "confirmed_count": 0, "contradicted_count": 0}}]
+        result = engine._apply_lifecycle_scoring(items)
+        assert abs(result[0]["score"] - 0.1) < 0.01
+
+    def test_archived_memory_zero_score(self, engine):
+        """Archived memories should be excluded entirely."""
+        items = [{"score": 1.0, "metadata": {"status": "archived", "confirmed_count": 0, "contradicted_count": 0}}]
+        result = engine._apply_lifecycle_scoring(items)
+        assert len(result) == 0
+
+    def test_confidence_factor_boosts_confirmed(self, engine):
+        """Confirmed memories should get boosted by confidence factor."""
+        items = [{"score": 1.0, "metadata": {"status": "active", "confirmed_count": 4, "contradicted_count": 0}}]
+        result = engine._apply_lifecycle_scoring(items)
+        # confidence = (1+4)/(1+0) = 5.0, no cap in implementation
+        assert result[0]["score"] == 5.0
+
+    def test_confidence_factor_reduces_contradicted(self, engine):
+        """Contradicted memories should get reduced by confidence factor."""
+        items = [{"score": 1.0, "metadata": {"status": "active", "confirmed_count": 0, "contradicted_count": 4}}]
+        result = engine._apply_lifecycle_scoring(items)
+        # confidence = (1+0)/(1+4) = 0.2
+        assert abs(result[0]["score"] - 0.2) < 0.01
+
+    def test_no_status_defaults_to_active(self, engine):
+        """Items without status should be treated as active."""
+        items = [{"score": 1.0, "metadata": {}}]
+        result = engine._apply_lifecycle_scoring(items)
+        assert result[0]["score"] == 1.0

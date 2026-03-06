@@ -14,8 +14,11 @@ from typing import Any
 from fastapi import APIRouter, Query
 from fastapi.responses import HTMLResponse
 
+from app.config import get_settings
 from app.db.graph import Neo4jClient
 from app.db.vector import VectorClient
+
+_settings = get_settings()
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +62,7 @@ def create_dashboard_router(
             return {"memories": memories, "limit": limit, "offset": offset, "query": q}
         except Exception as exc:
             logger.error("Dashboard memories API error: %s", exc)
-            return {"memories": [], "limit": limit, "offset": offset, "query": q, "error": str(exc)}
+            return {"memories": [], "limit": limit, "offset": offset, "query": q, "error": "Internal service error"}
 
     @router.get("/api/graph")
     async def api_graph(
@@ -72,7 +75,7 @@ def create_dashboard_router(
             return snapshot
         except Exception as exc:
             logger.error("Dashboard graph API error: %s", exc)
-            return {"nodes": [], "edges": [], "error": str(exc)}
+            return {"nodes": [], "edges": [], "error": "Internal service error"}
 
     @router.get("/api/stats")
     async def api_stats():
@@ -96,7 +99,7 @@ def create_dashboard_router(
 
         # DLQ depth from Redis
         try:
-            dlq_key = "nexus:event_stream:dlq"
+            dlq_key = f"{_settings.REDIS_STREAM_KEY}:dlq"
             stats["dlq_depth"] = await redis_client.llen(dlq_key)
         except Exception:
             stats["dlq_depth"] = 0
@@ -120,7 +123,7 @@ def create_dashboard_router(
         offset: int = Query(default=0, ge=0),
     ):
         """Return DLQ items from Redis (paginated)."""
-        dlq_key = "nexus:event_stream:dlq"
+        dlq_key = f"{_settings.REDIS_STREAM_KEY}:dlq"
         try:
             total = await redis_client.llen(dlq_key)
             raw_items = await redis_client.lrange(dlq_key, offset, offset + limit - 1)
@@ -135,13 +138,13 @@ def create_dashboard_router(
             return {"items": items, "total": total, "limit": limit, "offset": offset}
         except Exception as exc:
             logger.error("Dashboard DLQ API error: %s", exc)
-            return {"items": [], "total": 0, "limit": limit, "offset": offset, "error": str(exc)}
+            return {"items": [], "total": 0, "limit": limit, "offset": offset, "error": "Internal service error"}
 
     @router.post("/api/dlq/retry")
     async def api_dlq_retry():
         """Move items from DLQ back to the main queue."""
-        dlq_key = "nexus:event_stream:dlq"
-        stream_key = "nexus:event_stream"
+        dlq_key = f"{_settings.REDIS_STREAM_KEY}:dlq"
+        stream_key = _settings.REDIS_STREAM_KEY
         try:
             count = 0
             while True:
@@ -153,17 +156,17 @@ def create_dashboard_router(
             return {"status": "ok", "retried": count}
         except Exception as exc:
             logger.error("Dashboard DLQ retry error: %s", exc)
-            return {"status": "error", "error": str(exc)}
+            return {"status": "error", "error": "Internal service error"}
 
     @router.delete("/api/dlq/clear")
     async def api_dlq_clear():
         """Clear the DLQ."""
-        dlq_key = "nexus:event_stream:dlq"
+        dlq_key = f"{_settings.REDIS_STREAM_KEY}:dlq"
         try:
             deleted = await redis_client.delete(dlq_key)
             return {"status": "ok", "deleted": deleted}
         except Exception as exc:
             logger.error("Dashboard DLQ clear error: %s", exc)
-            return {"status": "error", "error": str(exc)}
+            return {"status": "error", "error": "Internal service error"}
 
     return router

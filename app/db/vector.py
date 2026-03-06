@@ -716,6 +716,7 @@ class VectorClient:
     def _cache_put(self, key: str, value: list[float]) -> None:
         """Insert into the embedding cache with LRU eviction."""
         if key in self._embed_cache:
+            self._embed_cache[key] = value
             self._embed_cache.move_to_end(key)
             return
         if len(self._embed_cache) >= _EMBED_CACHE_MAX_SIZE:

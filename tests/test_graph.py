@@ -582,6 +582,45 @@ class TestCreateSupersession:
         call_kwargs = session.run.call_args.kwargs
         assert call_kwargs["detected"] == "auto"
 
+    @pytest.mark.asyncio
+    async def test_create_supersession_vector_uuid_path(self, client_with_driver):
+        """create_supersession should match older_id via MemoryRef.vector_id when it's a Qdrant UUID."""
+        session = client_with_driver._mock_session
+        session.run = AsyncMock()
+
+        vector_uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        await client_with_driver.create_supersession(
+            newer_id="elem-new",
+            older_id=vector_uuid,
+            reason="Qdrant UUID supersession",
+        )
+
+        session.run.assert_called_once()
+        call_args = session.run.call_args
+        query = call_args[0][0]
+        # Should use OPTIONAL MATCH for both element ID and MemoryRef vector_id
+        assert "OPTIONAL MATCH (older_by_eid)" in query
+        assert "OPTIONAL MATCH (older_by_ref:MemoryRef {vector_id: $older_id})" in query
+        assert "COALESCE(older_by_eid, older_by_ref)" in query
+        call_kwargs = call_args.kwargs
+        assert call_kwargs["older_id"] == vector_uuid
+
+    @pytest.mark.asyncio
+    async def test_create_supersession_query_structure(self, client_with_driver):
+        """create_supersession query should guard against null older node."""
+        session = client_with_driver._mock_session
+        session.run = AsyncMock()
+
+        await client_with_driver.create_supersession(
+            newer_id="elem-new",
+            older_id="elem-old",
+            reason="test",
+        )
+
+        query = session.run.call_args[0][0]
+        # Should have a WHERE older IS NOT NULL guard
+        assert "WHERE older IS NOT NULL" in query
+
 
 class TestGetSupersessionHistory:
     @pytest.mark.asyncio
