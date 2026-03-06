@@ -31,6 +31,12 @@ VALID_EVENTS = frozenset({
     "memory.recalled",
     "stream.ingested",
     "gc.pruned",
+    "agent.merged",
+    "agent.orphan_cleaned",
+    "agent.contradiction_found",
+    "agent.backlinks_added",
+    "agent.confidence_decayed",
+    "agent.reclassified",
 })
 
 

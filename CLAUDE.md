@@ -44,7 +44,8 @@ app/
 └── workers/
     ├── sleep_cycle.py # Celery worker: Redis → LLM extraction → Neo4j
     ├── gc.py          # Celery task: memory expiry & garbage collection
-    └── reembed.py     # Celery task: re-embed all vectors with new model
+    ├── reembed.py     # Celery task: re-embed all vectors with new model
+    └── memory_agent.py # Celery task: autonomous knowledge custodian (6 passes)
 ```
 
 ### API Endpoints
@@ -125,6 +126,7 @@ All configuration via environment variables or `.env` file. See `.env.example` f
 - `NEXUS_API_URL`, `MCP_HOST`, `MCP_PORT`, `NEXUS_API_KEY` (MCP server)
 - `DEFAULT_NAMESPACE`, `MAX_MEMORY_AGE_DAYS`, `GC_SCHEDULE_HOURS` (multi-tenant & GC)
 - `DLQ_MAX_SIZE`, `REEMBED_BATCH_SIZE`, `PRUNE_SCORE_THRESHOLD` (operations)
+- `AGENT_ENABLED`, `AGENT_SCHEDULE_HOURS`, `AGENT_DUPLICATE_THRESHOLD`, `AGENT_CONFIDENCE_DECAY_DAYS`, `AGENT_BATCH_LIMIT` (memory agent)
 
 ## Key Design Decisions
 
@@ -153,7 +155,7 @@ All configuration via environment variables or `.env` file. See `.env.example` f
 - **Multi-tenant namespaces**: Optional `namespace` field on all requests (default "default"), filters in both Neo4j and Qdrant
 - **Namespace graph**: `Namespace` nodes linked to `Domain` via `CONTAINS` edges for scoped queries
 - **Web dashboard**: Self-contained SPA with force-directed graph visualization, zero external dependencies
-- **Webhook system**: HMAC-SHA256 signed callbacks, event-type + namespace filtering, stored in Redis
+- **Webhook system**: HMAC-SHA256 signed callbacks, event-type + namespace filtering, stored in Redis. Events: `memory.learned`, `memory.recalled`, `stream.ingested`, `gc.pruned`, `agent.merged`, `agent.orphan_cleaned`, `agent.contradiction_found`, `agent.backlinks_added`, `agent.confidence_decayed`, `agent.reclassified`
 - **Memory GC**: Scheduled Celery task prunes old memories below score threshold, preserves positive feedback
 - **DLQ cap**: `LTRIM` after every DLQ push prevents unbounded Redis growth (configurable max 10K)
 - **Export/Import**: JSONL streaming for backup/migration, includes both vector and graph data
@@ -167,6 +169,7 @@ All configuration via environment variables or `.env` file. See `.env.example` f
 - **Supersession chains**: `SUPERSEDES` edges in Neo4j track knowledge evolution history
 - **Lifecycle scoring**: `final_score = base_score * status_multiplier * confidence_factor` (active=1.0, superseded=0.5, deprecated=0.1, archived=0.0)
 - **Automatic backlinks**: Obsidian-inspired — on `/learn`, discovers semantically related memories (0.4–0.84 similarity) across all domains and creates bidirectional `BACKLINK` edges in Neo4j. `MemoryRef` nodes bridge vector IDs to graph nodes.
+- **Memory Agent**: Autonomous knowledge custodian — Celery periodic task (default 6h) performing 6 self-healing passes: (1) duplicate detection & LLM-synthesized merge with fallback, (2) orphan node cleanup, (3) deep contradiction scan across domains, (4) backlink reinforcement for pre-feature memories, (5) confidence decay on stale unconfirmed memories, (6) cluster coherence with domain reclassification. Redis SETNX lock prevents overlapping runs. Per-pass error isolation ensures one failure doesn't stop others. Reports via webhook events: `agent.merged`, `agent.orphan_cleaned`, `agent.contradiction_found`, `agent.backlinks_added`, `agent.confidence_decayed`, `agent.reclassified`.
 
 ## Development Practices
 
@@ -180,4 +183,5 @@ All configuration via environment variables or `.env` file. See `.env.example` f
 - `docs/ARCHITECTURE.md` — Full architecture specification with module contracts
 - `docs/SECURITY_REVIEW.md` — Security review findings and fixes
 - `docs/plans/2026-03-05-major-improvements.md` — v0.5.0 implementation plan (15 fixes)
+- `docs/plans/2026-03-06-memory-agent-design.md` — Memory Agent autonomous custodian design
 - `docs/plans/2026-03-05-knowledge-lifecycle-design.md` — Knowledge lifecycle design document

@@ -49,6 +49,10 @@ def _create_celery_app() -> Celery:
                 "task": "app.workers.gc.prune_memories",
                 "schedule": timedelta(hours=s.GC_SCHEDULE_HOURS),
             },
+            "memory-agent": {
+                "task": "app.workers.memory_agent.run_memory_agent",
+                "schedule": timedelta(hours=s.AGENT_SCHEDULE_HOURS),
+            },
         },
     )
     return _app

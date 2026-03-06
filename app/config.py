@@ -65,6 +65,13 @@ class Settings(BaseSettings):
     # Namespace
     DEFAULT_NAMESPACE: str = "default"
 
+    # Memory Agent
+    AGENT_ENABLED: bool = True
+    AGENT_SCHEDULE_HOURS: int = 6
+    AGENT_DUPLICATE_THRESHOLD: float = 0.9
+    AGENT_CONFIDENCE_DECAY_DAYS: int = 180
+    AGENT_BATCH_LIMIT: int = 100
+
     # MCP Server
     NEXUS_API_URL: str = "http://localhost:8000"
     NEXUS_API_KEY: str | None = None
