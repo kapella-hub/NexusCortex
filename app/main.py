@@ -25,6 +25,7 @@ from slowapi.util import get_remote_address
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.config import get_settings
+from app.backlinks import discover_backlinks
 from app.contradiction import detect_and_supersede
 from app.dashboard import create_dashboard_router
 from app.db.graph import Neo4jClient
@@ -546,11 +547,27 @@ async def memory_learn(
     except Exception:
         logger.warning("Contradiction detection failed, continuing")
 
+    # Auto-discover backlinks — find related memories and create graph edges
+    backlinks: list[dict] = []
+    try:
+        backlinks = await discover_backlinks(
+            vector=vector,
+            graph=graph,
+            new_text=text,
+            new_vector_id=str(vector_result),
+            new_graph_id=str(graph_result),
+            domain=log.domain,
+            namespace=log.namespace,
+        )
+    except Exception:
+        logger.warning("Backlink discovery failed, continuing")
+
     # Fire webhooks in background (best-effort)
     try:
         asyncio.create_task(fire_webhooks(
             redis_client, "memory.learned",
-            {"graph_id": graph_result, "vector_id": vector_result, "action": log.action, "superseded": superseded},
+            {"graph_id": graph_result, "vector_id": vector_result, "action": log.action,
+             "superseded": superseded, "backlinks_found": len(backlinks)},
             namespace=log.namespace,
         ))
     except Exception:
@@ -562,6 +579,7 @@ async def memory_learn(
         vector_id=vector_result,
         namespace=log.namespace,
         superseded=superseded,
+        backlinks=backlinks,
     )
 
 

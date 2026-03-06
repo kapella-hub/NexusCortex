@@ -860,6 +860,41 @@ class Neo4jClient:
                 "superseded_by": superseded_by_list[0] if superseded_by_list else None,
             }
 
+    async def create_backlink(self, source_id: str, target_vector_id: str, score: float) -> None:
+        """Create a BACKLINK edge from a graph node to a related memory (by vector ID).
+
+        Uses the vector ID stored as a property for cross-referencing.
+        If the target doesn't exist as a graph node, creates a lightweight
+        reference node to preserve the link.
+        """
+        driver = self._ensure_driver()
+        async with driver.session() as session:
+            await session.run(
+                "MATCH (source) WHERE elementId(source) = $source_id "
+                "MERGE (ref:MemoryRef {vector_id: $target_vector_id}) "
+                "MERGE (source)-[:BACKLINK {score: $score, created: datetime()}]->(ref) "
+                "MERGE (ref)-[:BACKLINK {score: $score, created: datetime()}]->(source)",
+                source_id=source_id, target_vector_id=target_vector_id, score=score,
+            )
+
+    async def get_backlinks(self, vector_id: str) -> list[dict]:
+        """Get all backlinked memories for a given vector ID."""
+        driver = self._ensure_driver()
+        async with driver.session() as session:
+            result = await session.run(
+                "MATCH (ref:MemoryRef {vector_id: $vector_id})-[:BACKLINK]->(target) "
+                "RETURN elementId(target) AS graph_id, "
+                "       target.description AS text, "
+                "       labels(target)[0] AS label "
+                "UNION "
+                "MATCH (source)-[:BACKLINK]->(ref:MemoryRef {vector_id: $vector_id}) "
+                "RETURN elementId(source) AS graph_id, "
+                "       source.description AS text, "
+                "       labels(source)[0] AS label",
+                vector_id=vector_id,
+            )
+            return [dict(record) async for record in result]
+
     async def query_resolutions(
         self, error_pattern: str, limit: int = 5, namespace: str = "default"
     ) -> list[dict[str, Any]]:

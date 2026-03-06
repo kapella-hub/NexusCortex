@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException
 from app.db.graph import Neo4jClient
 from app.db.vector import VectorClient
 from app.models import (
+    BacklinksResponse,
     ConfirmRequest,
     ConfirmResponse,
     DeprecateRequest,
@@ -93,6 +94,16 @@ def create_lifecycle_router(graph: Neo4jClient, vector: VectorClient) -> APIRout
             confirmed_count=memory.get("confirmed_count", 0),
             contradicted_count=memory.get("contradicted_count", 0),
             last_confirmed_at=memory.get("last_confirmed_at"),
+        )
+
+    @router.get("/memory/{memory_id}/backlinks")
+    async def memory_backlinks(memory_id: str) -> BacklinksResponse:
+        """Get all automatically discovered backlinks for a memory."""
+        links = await graph.get_backlinks(memory_id)
+        return BacklinksResponse(
+            memory_id=memory_id,
+            backlinks=links,
+            total=len(links),
         )
 
     return router

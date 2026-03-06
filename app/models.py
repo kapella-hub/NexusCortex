@@ -134,6 +134,7 @@ class LearnResponse(BaseModel):
     vector_id: str | None = None
     namespace: str = "default"
     superseded: list[str] = []
+    backlinks: list[dict] = []
 
 
 class StreamResponse(BaseModel):
@@ -250,6 +251,14 @@ class ConfirmResponse(BaseModel):
 
     status: str
     confirmed: int
+
+
+class BacklinksResponse(BaseModel):
+    """Response from /memory/{id}/backlinks."""
+
+    memory_id: str
+    backlinks: list[dict] = []
+    total: int = 0
 
 
 class MemoryHistoryResponse(BaseModel):

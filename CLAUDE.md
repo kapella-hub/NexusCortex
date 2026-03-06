@@ -31,8 +31,9 @@ app/
 ├── transfer.py        # Export/import API (JSONL streaming)
 ├── streaming.py       # SSE streaming recall endpoint
 ├── embedding_admin.py # Embedding model admin (status, re-embed)
-├── lifecycle.py       # Knowledge lifecycle (deprecate, confirm, history)
+├── lifecycle.py       # Knowledge lifecycle (deprecate, confirm, history, backlinks)
 ├── contradiction.py   # Automatic contradiction detection & supersession
+├── backlinks.py       # Automatic backlink discovery (Obsidian-inspired)
 ├── static/
 │   └── dashboard.html # Self-contained dashboard SPA (zero dependencies)
 ├── db/
@@ -63,6 +64,7 @@ app/
 - `POST /memory/deprecate` — Change memory status (deprecated, superseded, archived)
 - `POST /memory/confirm` — Confirm memories are still valid (bumps confidence)
 - `GET /memory/{id}/history` — Get supersession chain for a memory
+- `GET /memory/{id}/backlinks` — Get automatically discovered related memories
 
 ### MCP Server (port 8080)
 Exposes 4 MCP tools via Streamable HTTP (`/mcp` endpoint):
@@ -73,12 +75,12 @@ Exposes 4 MCP tools via Streamable HTTP (`/mcp` endpoint):
 
 ### Data Flow
 - `/recall` → RAG engine queries Qdrant (semantic) + Neo4j (graph) concurrently → merges/boosts scores → Markdown
-- `/learn` → writes action chain to Neo4j (Domain→Action→Outcome→Resolution) + embeds to Qdrant → contradiction detection auto-supersedes stale memories
+- `/learn` → writes action chain to Neo4j (Domain→Action→Outcome→Resolution) + embeds to Qdrant → contradiction detection auto-supersedes stale memories → backlink discovery creates bidirectional edges to related memories
 - `/stream` → LPUSH to Redis → Celery Beat (60s) → LLM extraction → Neo4j MERGE
 
 ### Graph Schema
 - **Nodes**: Namespace, Domain, Concept, Action, Outcome, Resolution, EventStream
-- **Edges**: CONTAINS, RELATES_TO, CAUSED, RESOLVED_BY, UTILIZES, SUPERSEDES
+- **Edges**: CONTAINS, RELATES_TO, CAUSED, RESOLVED_BY, UTILIZES, SUPERSEDES, BACKLINK
 
 ## Commands
 
@@ -164,6 +166,7 @@ All configuration via environment variables or `.env` file. See `.env.example` f
 - **Confidence scoring**: `(1 + confirmed_count) / (1 + contradicted_count)` factor in recall scoring
 - **Supersession chains**: `SUPERSEDES` edges in Neo4j track knowledge evolution history
 - **Lifecycle scoring**: `final_score = base_score * status_multiplier * confidence_factor` (active=1.0, superseded=0.5, deprecated=0.1, archived=0.0)
+- **Automatic backlinks**: Obsidian-inspired — on `/learn`, discovers semantically related memories (0.4–0.84 similarity) across all domains and creates bidirectional `BACKLINK` edges in Neo4j. `MemoryRef` nodes bridge vector IDs to graph nodes.
 
 ## Development Practices
 
