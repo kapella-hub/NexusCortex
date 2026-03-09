@@ -63,6 +63,38 @@ services:
           memory: 256m
           cpus: "0.25"
 
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 8g
+          cpus: "4.0"
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        ollama pull qwen3:4b && ollama pull mxbai-embed-large && echo "Models ready"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    restart: "no"
+
   api:
     build:
       context: .
@@ -81,6 +113,8 @@ services:
       qdrant:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      ollama:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
@@ -108,6 +142,8 @@ services:
       redis:
         condition: service_healthy
       neo4j:
+        condition: service_healthy
+      ollama:
         condition: service_healthy
     deploy:
       resources:
@@ -165,3 +201,4 @@ volumes:
   neo4j_data:
   qdrant_data:
   redis_data:
+  ollama_data:

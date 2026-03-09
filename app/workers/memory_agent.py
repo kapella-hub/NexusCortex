@@ -213,7 +213,11 @@ def _merge_cluster(
             timeout=60.0,
         )
         response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
+        msg = response.json()["choices"][0]["message"]
+        content = msg.get("content") or ""
+        # Fallback: some models (e.g. qwen3) put output in a reasoning field
+        if not content.strip():
+            content = msg.get("reasoning") or ""
         parsed = json.loads(content)
         merged_text = parsed.get("text", "")
 

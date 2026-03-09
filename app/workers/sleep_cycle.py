@@ -40,6 +40,11 @@ def _create_celery_app() -> Celery:
         result_serializer="json",
         timezone="UTC",
         enable_utc=True,
+        include=[
+            "app.workers.gc",
+            "app.workers.memory_agent",
+            "app.workers.reembed",
+        ],
         beat_schedule={
             "sleep-cycle-consolidation": {
                 "task": "app.workers.sleep_cycle.process_event_batch",
@@ -345,7 +350,11 @@ def _process_batch() -> dict[str, Any]:
 
     # Parse LLM JSON
     try:
-        content = llm_response.json()["choices"][0]["message"]["content"]
+        msg = llm_response.json()["choices"][0]["message"]
+        content = msg.get("content") or ""
+        # Fallback: some models (e.g. qwen3) put output in a reasoning field
+        if not content.strip():
+            content = msg.get("reasoning") or ""
         knowledge = json.loads(content)
     except (KeyError, IndexError, json.JSONDecodeError) as exc:
         logger.error("Failed to parse LLM response: %s", exc)

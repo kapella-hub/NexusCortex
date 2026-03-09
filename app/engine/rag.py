@@ -675,13 +675,17 @@ class RAGEngine:
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.0,
-                "max_tokens": 10,
+                "max_tokens": 100,
             },
             headers=headers,
         )
         response.raise_for_status()
         data = response.json()
-        text = data["choices"][0]["message"]["content"].strip()
+        msg = data["choices"][0]["message"]
+        text = (msg.get("content") or "").strip()
+        # Fallback: some models (e.g. qwen3) put output in a reasoning field
+        if not text:
+            text = (msg.get("reasoning") or "").strip()
         return RAGEngine._parse_rerank_score(text)
 
     # ------------------------------------------------------------------

@@ -15,11 +15,9 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import PointVectors
 
 from app.config import get_settings
-from app.workers.sleep_cycle import _create_celery_app
+from app.workers.sleep_cycle import celery_app
 
 logger = logging.getLogger(__name__)
-
-celery_app = _create_celery_app()
 
 
 def _embed_texts_sync(

@@ -13,11 +13,9 @@ from typing import Any
 from qdrant_client import QdrantClient
 
 from app.config import get_settings
-from app.workers.sleep_cycle import _create_celery_app, _get_neo4j_driver
+from app.workers.sleep_cycle import celery_app, _get_neo4j_driver
 
 logger = logging.getLogger(__name__)
-
-celery_app = _create_celery_app()
 
 
 def _get_qdrant_client() -> QdrantClient:
