@@ -3,7 +3,12 @@
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+def normalize_namespace(ns: str) -> str:
+    """Normalize a namespace: lowercase, hyphens to underscores."""
+    return ns.lower().strip().replace("-", "_")
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +37,11 @@ class ContextQuery(BaseModel):
         }
     }
 
+    @field_validator("namespace")
+    @classmethod
+    def _normalize_namespace(cls, v: str) -> str:
+        return normalize_namespace(v)
+
 
 class ActionLog(BaseModel):
     """Record of an agent action and its outcome, optionally with a resolution."""
@@ -56,6 +66,11 @@ class ActionLog(BaseModel):
             ]
         }
     }
+
+    @field_validator("namespace")
+    @classmethod
+    def _normalize_namespace(cls, v: str) -> str:
+        return normalize_namespace(v)
 
 
 _MAX_PAYLOAD_SERIALIZED_BYTES = 50_000  # 50 KB limit per event payload
@@ -100,6 +115,11 @@ class GenericEventIngest(BaseModel):
             ]
         }
     }
+
+    @field_validator("namespace")
+    @classmethod
+    def _normalize_namespace(cls, v: str) -> str:
+        return normalize_namespace(v)
 
 
 # ---------------------------------------------------------------------------

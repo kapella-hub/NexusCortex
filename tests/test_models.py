@@ -394,7 +394,7 @@ class TestNamespaceValidation:
     def test_valid_namespace_with_hyphens(self):
         """Namespace with hyphens should be accepted."""
         q = ContextQuery(task="test", namespace="my-agent-1")
-        assert q.namespace == "my-agent-1"
+        assert q.namespace == "my_agent_1"
 
     def test_valid_namespace_with_underscores(self):
         """Namespace with underscores should be accepted."""
@@ -430,13 +430,13 @@ class TestNamespaceValidation:
     def test_namespace_on_all_request_models(self):
         """All request models should accept custom namespaces."""
         q = ContextQuery(task="test", namespace="tenant-A")
-        assert q.namespace == "tenant-A"
+        assert q.namespace == "tenant_a"
 
         log = ActionLog(action="a", outcome="o", namespace="tenant-B")
-        assert log.namespace == "tenant-B"
+        assert log.namespace == "tenant_b"
 
         event = GenericEventIngest(source="s", payload={}, namespace="tenant-C")
-        assert event.namespace == "tenant-C"
+        assert event.namespace == "tenant_c"
 
     def test_recall_response_custom_namespace(self):
         """RecallResponse should accept custom namespace."""
@@ -449,6 +449,41 @@ class TestNamespaceValidation:
         """LearnResponse should accept custom namespace."""
         lr = LearnResponse(status="stored", namespace="agent-2")
         assert lr.namespace == "agent-2"
+
+    def test_namespace_hyphens_normalized_to_underscores(self):
+        """Hyphens in namespace should be normalized to underscores."""
+        q = ContextQuery(task="test", namespace="automation-portal")
+        assert q.namespace == "automation_portal"
+
+    def test_namespace_uppercase_normalized_to_lowercase(self):
+        """Uppercase namespace should be normalized to lowercase."""
+        q = ContextQuery(task="test", namespace="AutomationPortal")
+        assert q.namespace == "automationportal"
+
+    def test_namespace_mixed_case_hyphens_normalized(self):
+        """Mixed case with hyphens should be fully normalized."""
+        q = ContextQuery(task="test", namespace="My-Agent-1")
+        assert q.namespace == "my_agent_1"
+
+    def test_namespace_normalization_on_action_log(self):
+        """ActionLog namespace should be normalized."""
+        log = ActionLog(action="a", outcome="o", namespace="Tenant-B")
+        assert log.namespace == "tenant_b"
+
+    def test_namespace_normalization_on_event_ingest(self):
+        """GenericEventIngest namespace should be normalized."""
+        event = GenericEventIngest(source="s", payload={}, namespace="Tenant-C")
+        assert event.namespace == "tenant_c"
+
+    def test_namespace_default_unchanged(self):
+        """Default namespace 'default' should pass through unchanged."""
+        q = ContextQuery(task="test")
+        assert q.namespace == "default"
+
+    def test_namespace_already_normalized_unchanged(self):
+        """Already normalized namespace should pass through unchanged."""
+        q = ContextQuery(task="test", namespace="my_agent_1")
+        assert q.namespace == "my_agent_1"
 
 
 # ---------------------------------------------------------------------------
