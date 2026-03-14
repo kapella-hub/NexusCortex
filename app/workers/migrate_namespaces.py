@@ -85,7 +85,7 @@ def _migrate_neo4j() -> dict[str, Any]:
     with driver.session() as session:
         # Get all namespace nodes
         result = session.run("MATCH (ns:Namespace) RETURN ns.name AS name")
-        namespaces = [record["name"] for record in result]
+        namespaces = [record["name"] for record in result if record["name"] is not None]
 
         # Group by normalized name
         groups: dict[str, list[str]] = {}
