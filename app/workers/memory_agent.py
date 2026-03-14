@@ -209,7 +209,7 @@ def _merge_cluster(
                 "temperature": 0.1,
                 "response_format": {"type": "json_object"},
             },
-            headers={"Authorization": f"Bearer {settings.LLM_API_KEY}"},
+            headers={"Authorization": f"Bearer {settings.LLM_API_KEY}"} if settings.LLM_API_KEY else {},
             timeout=60.0,
         )
         response.raise_for_status()
@@ -221,28 +221,26 @@ def _merge_cluster(
         parsed = json.loads(content)
         merged_text = parsed.get("text", "")
 
-        # Validate: merged text should be reasonable length
+        # Validate: merged text should be non-empty and reasonable length
         min_len = min(len(t) for t in texts) // 2
-        if len(merged_text) >= min_len:
+        if merged_text.strip() and len(merged_text) >= max(min_len, 10):
             method = "llm"
         else:
             merged_text = None
     except Exception:
         logger.warning("LLM merge failed, using fallback")
 
-    # Fallback: keep highest confidence memory
+    # Always select highest confidence memory as keeper
+    best = max(
+        cluster,
+        key=lambda m: (1 + m["confirmed_count"]) / (1 + m["contradicted_count"]),
+    )
+
+    # Fallback: keep highest confidence memory's text
     if merged_text is None:
-        best = max(
-            cluster,
-            key=lambda m: (1 + m["confirmed_count"]) / (1 + m["contradicted_count"]),
-        )
         merged_text = best["text"]
 
-    # The "winner" is the best memory (highest confidence); supersede the rest
-    if method == "llm":
-        keeper = cluster[0]
-    else:
-        keeper = best
+    keeper = best
     superseded_ids = [m["id"] for m in cluster if m["id"] != keeper["id"]]
 
     # Update superseded memories' status
@@ -597,16 +595,16 @@ def backlink_reinforcement_pass() -> dict[str, Any]:
             )
 
             new_backlinks = 0
-            for sp in similar_results.points:
-                sp_id = str(sp.id)
-                if sp_id == vid:
-                    continue
-                if sp.score < 0.4 or sp.score > 0.84:
-                    continue
+            with driver.session() as session:
+                for sp in similar_results.points:
+                    sp_id = str(sp.id)
+                    if sp_id == vid:
+                        continue
+                    if sp.score < 0.4 or sp.score > 0.84:
+                        continue
 
-                # Create bidirectional BACKLINK edge
-                try:
-                    with driver.session() as session:
+                    # Create bidirectional BACKLINK edge
+                    try:
                         session.run(
                             "MERGE (ref_a:MemoryRef {vector_id: $vid_a}) "
                             "MERGE (ref_b:MemoryRef {vector_id: $vid_b}) "
@@ -614,9 +612,9 @@ def backlink_reinforcement_pass() -> dict[str, Any]:
                             "MERGE (ref_b)-[:BACKLINK {score: $score, created: datetime()}]->(ref_a)",
                             vid_a=vid, vid_b=sp_id, score=sp.score,
                         )
-                    new_backlinks += 1
-                except Exception:
-                    logger.warning("Failed to create backlink %s <-> %s", vid, sp_id)
+                        new_backlinks += 1
+                    except Exception:
+                        logger.warning("Failed to create backlink %s <-> %s", vid, sp_id)
 
             if new_backlinks > 0:
                 backlink_info = {"memory_id": vid, "new_backlinks": new_backlinks}
@@ -682,8 +680,8 @@ def confidence_decay_pass() -> dict[str, Any]:
                 contradicted = payload.get("contradicted_count", 0)
                 confidence = (1 + confirmed) / (1 + contradicted)
 
-                # Skip memories that can't be further decayed
-                if confirmed == 0 and confidence >= 0.5:
+                # Skip untouched memories (no signal in either direction)
+                if confirmed == 0 and contradicted == 0:
                     continue
 
                 if confidence < 0.5:

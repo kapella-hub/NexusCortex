@@ -340,7 +340,7 @@ def _process_batch() -> dict[str, Any]:
                 "temperature": 0.1,
                 "response_format": {"type": "json_object"},
             },
-            headers={"Authorization": f"Bearer {settings.LLM_API_KEY}"},
+            headers={"Authorization": f"Bearer {settings.LLM_API_KEY}"} if settings.LLM_API_KEY else {},
             timeout=120.0,
         )
         llm_response.raise_for_status()
