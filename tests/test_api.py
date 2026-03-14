@@ -78,6 +78,55 @@ class TestHealthEndpoint:
         assert body["status"] == "degraded"
         assert body["services"]["redis"]["status"] == "disconnected"
 
+    def test_health_caches_response(self, test_client, mock_graph, mock_vector, mock_redis):
+        """Second health call within TTL should not re-probe backends."""
+        mock_graph.ping = AsyncMock()
+        mock_vector.ping = AsyncMock()
+        mock_vector.memory_count = AsyncMock(return_value=42)
+        mock_redis.ping = AsyncMock()
+
+        # First call — probes everything
+        resp1 = test_client.get("/health")
+        assert resp1.status_code == 200
+
+        # Reset mocks to track second call
+        mock_graph.ping.reset_mock()
+        mock_vector.ping.reset_mock()
+        mock_vector.memory_count.reset_mock()
+        mock_redis.ping.reset_mock()
+
+        # Second call — should use cache, no backend calls
+        resp2 = test_client.get("/health")
+        assert resp2.status_code == 200
+        assert resp2.json() == resp1.json()
+
+        mock_graph.ping.assert_not_called()
+        mock_vector.ping.assert_not_called()
+        mock_redis.ping.assert_not_called()
+
+    def test_health_cache_expires(self, test_client, mock_graph, mock_vector, mock_redis):
+        """Health cache should expire after TTL."""
+        from datetime import datetime, timezone, timedelta
+
+        mock_graph.ping = AsyncMock()
+        mock_vector.ping = AsyncMock()
+        mock_vector.memory_count = AsyncMock(return_value=42)
+        mock_redis.ping = AsyncMock()
+
+        # First call
+        test_client.get("/health")
+
+        # Simulate time passing beyond TTL
+        from app import main as main_module
+        main_module._health_cache_time = datetime.now(timezone.utc) - timedelta(seconds=30)
+
+        mock_graph.ping.reset_mock()
+
+        # Call after cache expired — should re-probe
+        resp = test_client.get("/health")
+        assert resp.status_code == 200
+        mock_graph.ping.assert_called_once()
+
     def test_health_degraded_includes_error_detail(self, test_client, mock_graph, mock_vector, mock_redis):
         """Disconnected services include generic detail (no internal info leak)."""
         mock_graph.ping = AsyncMock(side_effect=RuntimeError("connection refused"))

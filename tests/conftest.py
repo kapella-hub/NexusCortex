@@ -116,6 +116,10 @@ def test_client(mock_graph: AsyncMock, mock_vector: AsyncMock, mock_redis: Async
     app.dependency_overrides[get_redis] = _override_redis
     app.dependency_overrides[get_rag_engine] = _override_rag_engine
 
+    from app import main as main_module
+    main_module._health_cache = None
+    main_module._health_cache_time = None
+
     with TestClient(app, raise_server_exceptions=False) as client:
         yield client
 

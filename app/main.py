@@ -72,6 +72,11 @@ logger = logging.getLogger(__name__)
 MAX_BATCH_SIZE = 100
 MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
 
+# Health check cache (10-second TTL to reduce backend probing)
+_health_cache: HealthResponse | None = None
+_health_cache_time: datetime | None = None
+_HEALTH_CACHE_TTL_SECONDS = 10.0
+
 # ---------------------------------------------------------------------------
 # Rate limiter
 # ---------------------------------------------------------------------------
@@ -420,7 +425,17 @@ async def health(
     vector: Annotated[VectorClient, Depends(get_vector)],
     redis_client: Annotated[redis.asyncio.Redis, Depends(get_redis)],
 ) -> HealthResponse:
-    """Return service health status by probing each backend."""
+    """Return service health status by probing each backend (cached for 10s)."""
+    global _health_cache, _health_cache_time
+
+    now = datetime.now(timezone.utc)
+    if (
+        _health_cache is not None
+        and _health_cache_time is not None
+        and (now - _health_cache_time).total_seconds() < _HEALTH_CACHE_TTL_SECONDS
+    ):
+        return _health_cache
+
     services: dict[str, ServiceStatus] = {}
 
     # Redis
@@ -451,7 +466,7 @@ async def health(
     uptime_seconds: float | None = None
     try:
         start_time = app.state.start_time
-        uptime_seconds = (datetime.now(timezone.utc) - start_time).total_seconds()
+        uptime_seconds = (now - start_time).total_seconds()
     except AttributeError:
         pass
 
@@ -459,13 +474,17 @@ async def health(
     memory_count = await vector.memory_count()
 
     all_connected = all(s.status == "connected" for s in services.values())
-    return HealthResponse(
+    result = HealthResponse(
         status="ok" if all_connected else "degraded",
         services=services,
         version="0.6.0",
         uptime_seconds=uptime_seconds,
         memory_count=memory_count,
     )
+
+    _health_cache = result
+    _health_cache_time = now
+    return result
 
 
 @app.post("/memory/recall", response_model=RecallResponse)
