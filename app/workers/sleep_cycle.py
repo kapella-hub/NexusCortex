@@ -44,6 +44,7 @@ def _create_celery_app() -> Celery:
             "app.workers.gc",
             "app.workers.memory_agent",
             "app.workers.reembed",
+            "app.workers.migrate_namespaces",
         ],
         beat_schedule={
             "sleep-cycle-consolidation": {
