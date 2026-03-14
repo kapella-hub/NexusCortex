@@ -169,6 +169,8 @@ All configuration via environment variables or `.env` file. See `.env.example` f
 - **Supersession chains**: `SUPERSEDES` edges in Neo4j track knowledge evolution history
 - **Lifecycle scoring**: `final_score = base_score * status_multiplier * confidence_factor` (active=1.0, superseded=0.5, deprecated=0.1, archived=0.0)
 - **Automatic backlinks**: Obsidian-inspired — on `/learn`, discovers semantically related memories (0.4–0.84 similarity) across all domains and creates bidirectional `BACKLINK` edges in Neo4j. `MemoryRef` nodes bridge vector IDs to graph nodes.
+- **Namespace normalization**: All incoming namespaces are normalized (lowercase, hyphens to underscores) via Pydantic field validators. One-time migration task (`migrate_namespaces`) consolidates pre-existing data in Qdrant and Neo4j.
+- **Health check caching**: `/health` response is cached for 10 seconds to reduce backend probing (~35K fewer calls/day). Stale uptime/status for up to 10s is acceptable.
 - **Memory Agent**: Autonomous knowledge custodian — Celery periodic task (default 6h) performing 6 self-healing passes: (1) duplicate detection & LLM-synthesized merge with fallback, (2) orphan node cleanup, (3) deep contradiction scan across domains, (4) backlink reinforcement for pre-feature memories, (5) confidence decay on stale unconfirmed memories, (6) cluster coherence with domain reclassification. Redis SETNX lock prevents overlapping runs. Per-pass error isolation ensures one failure doesn't stop others. Reports via webhook events: `agent.merged`, `agent.orphan_cleaned`, `agent.contradiction_found`, `agent.backlinks_added`, `agent.confidence_decayed`, `agent.reclassified`.
 
 ## Development Practices
