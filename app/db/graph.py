@@ -595,9 +595,13 @@ class Neo4jClient:
         where_clause = " OR ".join(conditions)
 
         # Build namespace filter clause
-        ns_filter = ""
+        ns_filter_start = ""
+        ns_filter_related = ""
         if namespace != "default":
-            ns_filter = (
+            ns_filter_start = (
+                "AND EXISTS((start)<-[:CONTAINS*..3]-(:Namespace {name: $namespace}))"
+            )
+            ns_filter_related = (
                 "AND EXISTS((related)<-[:CONTAINS*..3]-(:Namespace {name: $namespace}))"
             )
             params["namespace"] = namespace
@@ -610,7 +614,8 @@ class Neo4jClient:
           AND ({where_clause})
           AND (related:Domain OR related:Concept OR related:Action
                OR related:Outcome OR related:Resolution)
-          {ns_filter}
+          {ns_filter_start}
+          {ns_filter_related}
         RETURN DISTINCT related.name AS name,
                related.description AS description,
                labels(related)[0] AS label,
