@@ -165,8 +165,8 @@ class VectorClient:
                         oldest = ts_str
                     if newest is None or ts_str > newest:
                         newest = ts_str
-                domain = payload.get("domain", "default")
-                namespace_counts[domain] = namespace_counts.get(domain, 0) + 1
+                ns = payload.get("namespace", "default")
+                namespace_counts[ns] = namespace_counts.get(ns, 0) + 1
 
             if next_offset is None:
                 break
@@ -189,7 +189,7 @@ class VectorClient:
             scroll_filter = Filter(
                 must=[
                     FieldCondition(
-                        key="domain",
+                        key="namespace",
                         match=MatchAny(any=[namespace]),
                     )
                 ]
@@ -218,7 +218,7 @@ class VectorClient:
                     "id": str(point.id),
                     "text": payload.get("text", ""),
                     "metadata": payload.get("metadata", {}),
-                    "namespace": payload.get("domain", "default"),
+                    "namespace": payload.get("namespace", "default"),
                     "tags": payload.get("tags", []),
                     "source": payload.get("source", ""),
                     "created_at": payload.get("timestamp", ""),
@@ -251,7 +251,7 @@ class VectorClient:
                     query_filter = Filter(
                         must=[
                             FieldCondition(
-                                key="domain",
+                                key="namespace",
                                 match=MatchAny(any=[namespace]),
                             )
                         ]
@@ -284,7 +284,7 @@ class VectorClient:
                     scroll_filter = Filter(
                         must=[
                             FieldCondition(
-                                key="domain",
+                                key="namespace",
                                 match=MatchAny(any=[namespace]),
                             )
                         ]
